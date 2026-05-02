@@ -1,79 +1,48 @@
 # receipt-printer
 
-Print Claude Code session receipts on a thermal printer at home.
+## Intro Pitch
 
-This repo has two parts:
+Problem: good AI work disappears into chat history, logs, and terminals.
 
-- `server/` — a FastAPI service that runs on a Raspberry Pi and talks to an Epson TM-T20II over `/dev/usb/lp0`
-- `client/print-session.sh` — a Claude Code `SessionEnd` hook that decides whether a session is worth printing, then POSTs a receipt to the server
+Solution: `receipt-printer` turns finished sessions and hand-picked reports into small physical tickets on a thermal printer.
 
-The current live target is the Raspberry Pi at `100.78.6.79`, where the standalone deployment lives in `/home/denya/receipt-printer-service/`.
+Benefits: you get a durable artifact, a fast way to print polished summaries manually, and optional Claude/Codex automation when you actually want it.
 
-## Repo layout
+Examples:
 
-```text
-receipt-printer/
-├── README.md
-├── examples/
-├── spec.md
-├── client/
-│   └── print-session.sh
-└── server/
-    ├── .env.example
-    ├── Dockerfile
-    ├── docker-compose.yml
-    ├── main.py
-    ├── printer.py
-    ├── renderer.py
-    ├── requirements.txt
-    ├── schemas.py
-    └── tests/
-```
+<table>
+  <tr>
+    <td align="center">
+      <img src="./examples/DEMO%20TICKET1.jpeg" alt="README ticket photo" width="260">
+    </td>
+    <td align="center">
+      <img src="./examples/ALL%20The%20Graphics.jpeg" alt="Graphics ticket photo" width="260">
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="./examples/session-demo-render.png" alt="Session demo render" width="260">
+    </td>
+    <td align="center">
+      <img src="./examples/graphics-demo-render.png" alt="Graphics demo render" width="260">
+    </td>
+  </tr>
+</table>
 
-## Example tickets
+## For Humans
 
-Physical ticket photo:
+### Pick your mode
 
-![README showcase photo](./examples/readme-showcase-photo.jpeg)
+| If you want... | Use |
+|---|---|
+| manual printing to an existing printer server | client-side `curl` requests only |
+| automatic Claude/Codex receipts | client-side hook wiring, optionally |
+| your own printer host | `server/` on a Pi or other Linux machine |
+| one-MacBook preview/manual mode | local dry-run server |
 
-Renderer output examples:
+### Manual printing
 
-![Session demo render](./examples/session-demo-render.png)
-
-![Graphics demo render](./examples/graphics-demo-render.png)
-
-## What the server exposes
-
-- `GET /health` — reports whether the service is ready
-- `POST /print/test` — text-only printer smoke test
-- `POST /print/text` — print plain text
-- `POST /print/session` — print a Claude session receipt
-- `POST /print/rich` — print arbitrary rendered blocks
-
-Example:
-
-```bash
-curl http://100.78.6.79:9100/health
-curl -X POST http://100.78.6.79:9100/print/test
-curl -X POST http://100.78.6.79:9100/print/session \
-  -H 'Content-Type: application/json' \
-  -d '{"brand":"CLAUDE","title":"Shipped fix","results":["Reviewed code","Patched bug"]}'
-```
-
-## How To Install
-
-Start by choosing the mode that matches what you actually want.
-
-| Goal | What you install | Hook wiring |
-|---|---|---|
-| You already have a printer server somewhere and only want to print nice reports manually | client-side commands only | no |
-| You already have a printer server somewhere and want automatic Claude/Codex session receipts | client-side commands + optional hooks | yes |
-| You want to run your own printer server | `server/` on a Pi/Linux box, then optional clients | optional |
-| You are on one MacBook and just want to experiment, preview layouts, or manually trigger reports | local dry-run server or an existing remote server | no by default |
-
-### 1. Manual use against an existing printer server
-
-This is the simplest path. No hook wiring, no automatic printing, just manual report printing when you want it.
+If you already have a server with a printer attached somewhere, this is the simplest path.
 
 ```bash
 export PRINTER_URL="http://100.78.6.79:9100"
@@ -83,75 +52,11 @@ curl -X POST "$PRINTER_URL/print/session" \
   -d '{"brand":"README","title":"Manual print","results":["Manual mode is enough for many users"]}'
 ```
 
-For richer layouts, use `/print/rich` and build the ticket out of blocks. The contract for that lives in [server/SKILL.md](./server/SKILL.md).
+Use `/print/session` for clean branded summary slips and `/print/rich` when you want charts, QR codes, tables, ornaments, and custom layouts.
 
-### 2. Optional hook wiring for automatic session receipts
+### Run your own server
 
-Only do this if you explicitly want Claude Code or Codex to print automatically after useful sessions. If you only want manual reports, stop after step 1.
-
-#### Claude Code
-
-```bash
-mkdir -p ~/.claude/hooks
-cp client/print-session.sh ~/.claude/hooks/print-session.sh
-chmod +x ~/.claude/hooks/print-session.sh
-```
-
-Example `~/.claude/settings.json` snippet:
-
-```json
-{
-  "hooks": {
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/Users/denya/.claude/hooks/print-session.sh"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-Useful env vars:
-
-- `PRINTER_URL` — defaults to `http://100.78.6.79:9100/print/session`
-- `ANTHROPIC_API_KEY` — enables the Haiku print-worthiness filter
-- `PRINT_FILTER=off` — bypasses the filter and prints every session
-
-#### Codex
-
-Codex does not expose the same session-end hook here. The practical surface is the global `notify` callback after each completed turn.
-
-```bash
-mkdir -p ~/.codex/hooks
-cp client/print-codex-notify.py ~/.codex/hooks/print-codex-notify.py
-chmod +x ~/.codex/hooks/print-codex-notify.py
-cp ~/.codex/config.toml ~/.codex/config.toml.bak-receipt-hook
-```
-
-Then change `notify = [...]` in `~/.codex/config.toml` so `--previous-notify` points at:
-
-```json
-["/Users/denya/.codex/hooks/print-codex-notify.py"]
-```
-
-The wrapper keeps the existing oh-my-codex notify chain intact and only adds printing on top.
-
-### 3. Run your own server
-
-If you want a real physical printer host, the supported path today is a Raspberry Pi or another Linux machine with the Epson exposed as `/dev/usb/lp0`.
-
-The standalone service on the live Pi is deployed into:
-
-```text
-/home/denya/receipt-printer-service/
-```
-
-#### Quick path: use this repo directly
+The first-class physical-printer path is a Raspberry Pi or other Linux box with the Epson exposed as `/dev/usb/lp0`.
 
 ```bash
 git clone https://github.com/denya/receipt-printer.git
@@ -169,30 +74,11 @@ PRINTER_WIDTH_CHARS=48
 PRINTER_DRY_RUN=0
 ```
 
-#### Build-your-own path: use the spec
+If you want to build your own compatible version instead of using this repo directly, use [spec.md](./spec.md).
 
-If you do not want to use this repo directly, [`spec.md`](./spec.md) is the full build-from-scratch contract: architecture, endpoints, request shapes, rendering expectations, hardware assumptions, and deployment order.
+### Single-machine MacBook mode
 
-Use that path when you want your own implementation but compatible client behavior.
-
-#### Updating a standalone Pi deployment
-
-```bash
-rsync -av \
-  --exclude '__pycache__/' \
-  --exclude '.env' \
-  ./server/ denya@100.78.6.79:/home/denya/receipt-printer-service/
-
-ssh denya@100.78.6.79 '
-  cd /home/denya/receipt-printer-service &&
-  docker compose up -d --build &&
-  curl -sf http://127.0.0.1:9100/health
-'
-```
-
-### 4. Single-machine MacBook mode
-
-If you are on one working MacBook with Claude/Codex and only want to design tickets, test rendering, or manually trigger nice reports, use local dry-run mode.
+If you just want to preview layouts, iterate on tickets, or manually trigger reports from one MacBook, use dry-run mode:
 
 ```bash
 cd server
@@ -202,7 +88,7 @@ pip install -r requirements.txt
 PRINTER_DRY_RUN=1 uvicorn main:app --host 127.0.0.1 --port 9100
 ```
 
-Then in another terminal:
+Then:
 
 ```bash
 curl http://127.0.0.1:9100/health
@@ -211,37 +97,53 @@ curl -X POST http://127.0.0.1:9100/print/session \
   -d '{"brand":"README","title":"Dry run","results":["No physical printer required"]}'
 ```
 
-This is the recommended same-laptop mode for README work, layout iteration, and manual ticket experiments.
+### Optional automation
 
-If you need actual paper output, the current first-class hardware path is still a Linux/Pi printer host. On macOS, the practical setup is usually:
+Hook wiring is optional. Skip it if you only want manual printing.
 
-1. Claude/Codex run on the MacBook.
-2. The printer service runs on a Pi or other Linux host.
-3. The MacBook talks to that server over `PRINTER_URL`.
-
-## Local development
-
-Create a virtualenv and install the server dependencies:
+Claude Code:
 
 ```bash
-cd server
-python3 -m venv ../.venv
-. ../.venv/bin/activate
-pip install -r requirements.txt
+mkdir -p ~/.claude/hooks
+cp client/print-session.sh ~/.claude/hooks/print-session.sh
+chmod +x ~/.claude/hooks/print-session.sh
 ```
 
-Run the tests:
+Codex:
 
 ```bash
-. ../.venv/bin/activate
-python -m unittest discover -s tests -v
+mkdir -p ~/.codex/hooks
+cp client/print-codex-notify.py ~/.codex/hooks/print-codex-notify.py
+chmod +x ~/.codex/hooks/print-codex-notify.py
 ```
 
-## Configurable header brand
+The Claude hook uses `SessionEnd`. The Codex hook uses the global `notify` surface and keeps the existing oh-my-codex notify chain intact.
 
-`/print/session` now accepts a `brand` field, so the large header can be `CLAUDE`, `CODEX`, `README`, or any other short label.
+## For Agents
 
-Example:
+### Use the right surface
+
+- Use `/print/session` for “task done” slips with `brand`, `title`, `results`, `model`, `turns`, and `duration`.
+- Use `/print/rich` for composed tickets with charts, tables, ornaments, progress bars, heatmaps, and QR codes.
+- Use `/print/test` when you need to verify hardware separately from the renderer.
+- Use `/health` before longer or higher-value runs.
+
+### Current capabilities
+
+- Configurable session header brand: `CLAUDE`, `CODEX`, `README`, or any short label.
+- Rich ticket blocks: `header`, `title`, `text`, `bullets`, `bar_chart`, `sparkline`, `pie_chart`, `progress_bar`, `heatmap`, `table`, `qr_code`, `ornament`, `spacer`.
+- QR codes can link back to the repo or docs directly from paper.
+- Dry-run mode supports local testing without a physical printer.
+
+### Where to look
+
+- [server/SKILL.md](./server/SKILL.md) is the caller contract for `/print/rich` composition.
+- [spec.md](./spec.md) is the build-from-scratch contract if you want to recreate the system or implement your own compatible version.
+- `examples/` contains real ticket photos and renderer outputs you can reference when designing new layouts.
+
+### Minimal examples
+
+Session ticket:
 
 ```bash
 curl -X POST http://100.78.6.79:9100/print/session \
@@ -249,9 +151,7 @@ curl -X POST http://100.78.6.79:9100/print/session \
   -d '{"brand":"CODEX","title":"Repo shipped","results":["Hook installed","Pi updated"]}'
 ```
 
-## QR codes in rich tickets
-
-`/print/rich` now supports a `qr_code` block, so tickets can include a scannable link to the repo or docs.
+Rich ticket with QR:
 
 ```bash
 curl -X POST http://100.78.6.79:9100/print/rich \
@@ -262,13 +162,3 @@ curl -X POST http://100.78.6.79:9100/print/rich \
     {"type":"qr_code","data":"https://github.com/denya/receipt-printer","label":"github.com/denya/receipt-printer"}
   ]}'
 ```
-
-## Current improvements in this repo
-
-- Font loading now falls back cleanly outside the container instead of crashing on hardcoded Linux font paths.
-- Rich-block rendering now survives renderer failures and prints an inline error tag instead of failing the whole request.
-- Table blocks now expand for wrapped cell content instead of silently truncating after the first line.
-- Dry-run mode makes local verification possible without a physical printer.
-- Focused unit tests protect the renderer and dry-run service behavior.
-
-See [`spec.md`](./spec.md) for the full system spec and design notes.
