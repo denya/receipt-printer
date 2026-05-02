@@ -1,0 +1,60 @@
+{
+  "manifest": {
+    "manifestVersion": "1.0",
+    "publishingInformation": {
+      "locales": {
+        "en-US": {
+          "name": "Session Monitor",
+          "summary": "Read the latest Claude and Codex session summaries.",
+          "description": "Session Monitor reads short voice summaries for the latest active Claude and Codex sessions from a home status service.",
+          "examplePhrases": [
+            "Alexa, open session monitor",
+            "Alexa, ask session monitor what is running",
+            "Alexa, ask session monitor for my active sessions"
+          ],
+          "keywords": [
+            "claude",
+            "codex",
+            "session",
+            "monitor"
+          ]
+        },
+        "es-ES": {
+          "name": "Monitor de Sesiones",
+          "summary": "Lee el resumen de tus sesiones activas de Claude y Codex.",
+          "description": "Monitor de Sesiones lee pequeños resúmenes por voz de las últimas sesiones activas de Claude y Codex desde un servicio casero de estado.",
+          "examplePhrases": [
+            "Alexa, abre monitor de sesiones",
+            "Alexa, pregunta a monitor de sesiones que se esta ejecutando",
+            "Alexa, pregunta a monitor de sesiones cual es el estado de mis sesiones"
+          ],
+          "keywords": [
+            "claude",
+            "codex",
+            "sesiones",
+            "monitor"
+          ]
+        }
+      },
+      "isAvailableWorldwide": true,
+      "distributionMode": "PUBLIC",
+      "testingInstructions": "Use the development skill on the owner's Alexa devices. The custom HTTPS endpoint is https://claude-alexa-skill.denyamsk.com/alexa and does not require account linking.",
+      "category": "BUSINESS_AND_FINANCE"
+    },
+    "privacyAndCompliance": {
+      "allowsPurchases": false,
+      "usesPersonalInfo": false,
+      "isChildDirected": false,
+      "isExportCompliant": true,
+      "containsAds": false
+    },
+    "apis": {
+        "custom": {
+          "endpoint": {
+            "uri": "https://claude-alexa-skill.denyamsk.com/alexa",
+            "sslCertificateType": "Wildcard"
+          }
+        }
+      }
+  }
+}

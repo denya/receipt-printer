@@ -12,6 +12,8 @@ services:
       # Pass through the kernel usblp device for the Epson TM-T20III.
       # The container runs as root, so it can open this 660 root:lp node.
       - /dev/usb/lp0:/dev/usb/lp0
+    volumes:
+      - ./data:/data
     ports:
       # Bind on all interfaces so devices on the 10.42.0.0/16 LAN can hit
       # this service. Port 9100 chosen per spec; no other process on the
@@ -21,6 +23,12 @@ services:
       - PRINTER_DEVICE=${PRINTER_DEVICE:-/dev/usb/lp0}
       - PRINTER_WIDTH_CHARS=${PRINTER_WIDTH_CHARS:-48}
       - PRINTER_DRY_RUN=${PRINTER_DRY_RUN:-0}
+      - STATUS_DB_PATH=${STATUS_DB_PATH:-/data/session-status.db}
+      - STATUS_API_TOKEN=${STATUS_API_TOKEN:-}
+      - ALEXA_SKILL_ID=${ALEXA_SKILL_ID:-}
+      - ALEXA_STATUS_LIMIT=${ALEXA_STATUS_LIMIT:-3}
+      - ALEXA_VERIFY_SIGNATURE=${ALEXA_VERIFY_SIGNATURE:-1}
+      - ALEXA_VERIFY_TIMESTAMP=${ALEXA_VERIFY_TIMESTAMP:-1}
     healthcheck:
       test:
         - "CMD-SHELL"

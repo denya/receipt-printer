@@ -1,0 +1,37 @@
+{
+  "interactionModel": {
+    "languageModel": {
+      "invocationName": "session monitor",
+      "intents": [
+        {
+          "name": "GetSessionStatusIntent",
+          "samples": [
+            "what is running",
+            "what is the status",
+            "what is the status of my sessions",
+            "what are my active sessions",
+            "give me my session status",
+            "give me my coding session status"
+          ]
+        },
+        {
+          "name": "AMAZON.HelpIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.CancelIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.StopIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.FallbackIntent",
+          "samples": []
+        }
+      ],
+      "types": []
+    }
+  }
+}

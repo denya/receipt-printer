@@ -1,0 +1,37 @@
+{
+  "interactionModel": {
+    "languageModel": {
+      "invocationName": "monitor de sesiones",
+      "intents": [
+        {
+          "name": "GetSessionStatusIntent",
+          "samples": [
+            "que se esta ejecutando",
+            "cual es el estado",
+            "cual es el estado de mis sesiones",
+            "que sesiones tengo activas",
+            "dame el estado de mis sesiones",
+            "dame el estado de mis sesiones de codigo"
+          ]
+        },
+        {
+          "name": "AMAZON.HelpIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.CancelIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.StopIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.FallbackIntent",
+          "samples": []
+        }
+      ],
+      "types": []
+    }
+  }
+}

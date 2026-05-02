@@ -50,8 +50,10 @@ if [ -n "${RECEIPT_PRINTER_VERIFIER:-}" ]; then
 fi
 
 PRINTER_URL="${PRINTER_URL:-http://100.78.6.79:9100/print/session}"
+STATUS_URL="${STATUS_URL:-${PRINTER_URL%/print/session}/status/update}"
 FILTER_MODEL="claude-haiku-4-5-20251001"
 STATE_PATH="${HOME}/.claude/hooks/print-stop-state.json"
+STATUS_TOKEN_FILE="${STATUS_TOKEN_FILE:-$HOME/.config/receipt-printer/status-api-token}"
 
 # Find claude CLI — Claude Code may launch hooks with a minimal PATH.
 if [ -z "${CLAUDE_BIN:-}" ]; then
@@ -73,7 +75,7 @@ session_id="$(printf '%s' "$event" | jq -r '.session_id // empty' 2>/dev/null ||
 cwd="$(printf '%s' "$event" | jq -r '.cwd // empty' 2>/dev/null || true)"
 stop_hook_active="$(printf '%s' "$event" | jq -r '.stop_hook_active // empty' 2>/dev/null || true)"
 
-python3 - "$transcript_path" "$session_id" "$cwd" "$PRINTER_URL" "$FILTER_MODEL" "$STATE_PATH" "$stop_hook_active" "${CLAUDE_BIN:-}" <<'PY' >/dev/null 2>&1 || true
+python3 - "$transcript_path" "$session_id" "$cwd" "$PRINTER_URL" "$STATUS_URL" "$FILTER_MODEL" "$STATE_PATH" "$stop_hook_active" "${CLAUDE_BIN:-}" "$STATUS_TOKEN_FILE" <<'PY' >/dev/null 2>&1 || true
 import datetime
 import hashlib
 import json
@@ -88,11 +90,13 @@ import urllib.request
     session_id,
     cwd,
     url,
+    status_url,
     filter_model,
     state_path,
     stop_hook_active,
     claude_bin,
-) = sys.argv[1:9]
+    status_token_file,
+) = sys.argv[1:10]
 
 title = "Claude session"
 results = []
@@ -166,6 +170,120 @@ if first_ts and last_ts:
     except Exception:
         pass
 
+
+def clean_text(text: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def split_sentences(text: str) -> list[str]:
+    chunks = re.split(r"(?<=[.!?])\s+", clean_text(text))
+    return [chunk.strip() for chunk in chunks if chunk.strip()]
+
+
+def classify_status(text: str) -> str:
+    lowered = clean_text(text).lower()
+    waiting_markers = (
+        "let me know",
+        "please confirm",
+        "confirm whether",
+        "before i proceed",
+        "before i continue",
+        "would you like",
+        "do you want",
+        "want me to",
+        "should i",
+        "if you'd like",
+        "if you want",
+    )
+    blocked_markers = (
+        "blocked",
+        "failed",
+        "failure",
+        "error",
+        "unable to",
+        "could not",
+        "can't ",
+        "cannot ",
+        "missing ",
+        "permission denied",
+        "timed out",
+    )
+    completion_markers = (
+        "tests passed",
+        "completed",
+        "done",
+        "deployed",
+        "fixed",
+        "updated",
+        "created",
+        "implemented",
+        "verified",
+        "shipped",
+    )
+    if lowered.endswith("?") or any(marker in lowered for marker in waiting_markers):
+        return "waiting"
+    if any(marker in lowered for marker in blocked_markers):
+        return "blocked"
+    if any(marker in lowered for marker in completion_markers):
+        return "completed"
+    interim_starts = (
+        "i'm ", "i am ", "i’ll ", "i will ", "checking ", "inspecting ",
+        "reviewing ", "running ", "looking ", "mapping ", "tracing ",
+    )
+    if lowered.startswith(interim_starts):
+        return "running"
+    return "unknown"
+
+
+def derive_summary_line(text: str, status: str) -> str:
+    if status == "waiting":
+        return "Waiting for your input."
+    sentences = split_sentences(text)
+    if sentences:
+        return sentences[0][:160]
+    return clean_text(text)[:160] or "Status update available."
+
+
+def load_status_token() -> str:
+    token = os.environ.get("STATUS_API_TOKEN", "").strip()
+    if token:
+        return token
+    try:
+        with open(os.path.expanduser(status_token_file), "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def post_status_update() -> None:
+    status = classify_status(last_assistant)
+    body = {
+        "source": "claude",
+        "session_key": session_key,
+        "turn_key": f"{session_key}:{current_hash}",
+        "title": title,
+        "summary_line": derive_summary_line(last_assistant, status),
+        "status": status,
+        "cwd": cwd or None,
+        "model": (model or "")[:80] or None,
+        "turns": turns or None,
+        "duration": duration,
+        "updated_at": last_ts,
+    }
+    body = {k: v for k, v in body.items() if v is not None and v != ""}
+    headers = {"Content-Type": "application/json"}
+    token = load_status_token()
+    if token:
+        headers["x-status-token"] = token
+    req = urllib.request.Request(
+        status_url,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    urllib.request.urlopen(req, timeout=4).read()
+
 # ---- Mid-conversation pre-filter (cheap, no API call) -----------------
 MID_CONVERSATION_PATTERNS = (
     "should i ", "shall i ", "shall we ", "want me to", "would you like",
@@ -195,8 +313,7 @@ def looks_like_mid_conversation(text: str) -> bool:
             return True
     return False
 
-if looks_like_mid_conversation(last_assistant):
-    sys.exit(0)
+mid_conversation = looks_like_mid_conversation(last_assistant)
 
 # ---- Dedup state -------------------------------------------------------
 # Stop fires after every assistant turn. If the user keeps the session
@@ -240,8 +357,15 @@ if sess_state.get("last_printed_hash") == current_hash:
     # Already printed THIS exact turn — nothing new.
     sys.exit(0)
 
+try:
+    post_status_update()
+except Exception:
+    pass
+
 # ---- Haiku decision (the reliable verdict) ----------------------------
 def haiku_says_print() -> bool:
+    if mid_conversation:
+        return False
     mode = os.environ.get("PRINT_FILTER", "").lower()
     if mode in ("off", "force"):
         return True

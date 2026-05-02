@@ -1,5 +1,5 @@
 """Request models for the receipt printer service."""
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
@@ -29,3 +29,20 @@ class RichRequest(BaseModel):
     back to a body-text rendering. See SKILL.md for the catalog.
     """
     blocks: List[Dict[str, Any]] = Field(..., min_length=1, max_length=80)
+
+
+class SessionStatusUpdate(BaseModel):
+    """Compact session-status update sent from a local hook to the Pi."""
+    source: Literal["codex", "claude"]
+    session_key: str = Field(..., min_length=1, max_length=200)
+    turn_key: Optional[str] = Field(None, max_length=255)
+    title: str = Field(..., min_length=1, max_length=200)
+    summary_line: str = Field(..., min_length=1, max_length=240)
+    status: Literal["running", "waiting", "completed", "blocked", "unknown"]
+    cwd: Optional[str] = Field(None, max_length=500)
+    model: Optional[str] = Field(None, max_length=80)
+    turns: Optional[int] = Field(None, ge=0, le=99999)
+    duration: Optional[str] = Field(None, max_length=40)
+    updated_at: Optional[str] = Field(
+        None, max_length=40, description="If omitted, server uses now."
+    )
