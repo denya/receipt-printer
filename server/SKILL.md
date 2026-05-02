@@ -206,6 +206,17 @@ to fit the print width. Keep matrices ≤ 12 cols for readability.
 Bold headers, hairline rules between rows. Cells truncate to one line —
 choose short labels.
 
+### `qr_code`
+```json
+{"type": "qr_code",
+ "data": "https://github.com/denya/receipt-printer",
+ "label": "github.com/denya/receipt-printer",
+ "size": 168}
+```
+Centered QR code rendered into the bitmap, with an optional caption below.
+Use this for repo links, docs, Wi-Fi bootstrap tickets, or any URL you want
+to make scannable from paper.
+
 ---
 
 ## Design guidelines

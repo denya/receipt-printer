@@ -27,6 +27,7 @@ import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
+import qrcode
 
 
 # ---------- canvas geometry ----------
@@ -577,6 +578,50 @@ def render_table(headers: List[str],
     return _to_bw_text(img)
 
 
+def render_qr_code(data: str,
+                   label: Optional[str] = None,
+                   size: int = 168,
+                   width: int = CONTENT_W) -> Image.Image:
+    if not data:
+        return Image.new("1", (width, 1), 1)
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=8,
+        border=2,
+    )
+    qr.add_data(data)
+    qr.make(fit=True)
+    qr_img = qr.make_image(fill_color="black", back_color="white").convert("1")
+    qr_img = qr_img.resize((size, size), Image.Resampling.NEAREST)
+
+    label_lines: List[str] = []
+    line_h = 0
+    f_label = _font(FONT_REGULAR, FS_CAPTION)
+    if label:
+        tmp = ImageDraw.Draw(Image.new("L", (1, 1), 255))
+        label_lines = _wrap(tmp, str(label), f_label, width)
+        line_h = int(_measure(tmp, "Mg", f_label)[1] * 1.20)
+
+    label_height = line_h * len(label_lines) if label_lines else 0
+    gap = 10 if label_lines else 0
+    total_h = size + gap + label_height
+    img = Image.new("L", (width, total_h), 255)
+    qr_x = (width - size) // 2
+    img.paste(qr_img.convert("L"), (qr_x, 0))
+
+    if label_lines:
+        draw = ImageDraw.Draw(img)
+        y = size + gap
+        for line in label_lines:
+            line_w, _ = _measure(draw, line, f_label)
+            draw.text(((width - line_w) // 2, y), line, font=f_label, fill=0)
+            y += line_h
+
+    return _to_bw_text(img)
+
+
 # ============================================================
 # BLOCK RENDERERS  (used by /print/rich and render_session)
 # ============================================================
@@ -774,6 +819,15 @@ def _block_table(b: Dict[str, Any]) -> Image.Image:
                         title=b.get("title"))
 
 
+def _block_qr_code(b: Dict[str, Any]) -> Image.Image:
+    return render_qr_code(
+        str(b.get("data", "")),
+        label=b.get("label"),
+        size=int(b.get("size", 168)),
+        width=CONTENT_W,
+    )
+
+
 _BLOCK_RENDERERS = {
     "header":       _block_header,
     "title":        _block_title,
@@ -787,6 +841,7 @@ _BLOCK_RENDERERS = {
     "progress_bar": _block_progress_bar,
     "heatmap":      _block_heatmap,
     "table":        _block_table,
+    "qr_code":      _block_qr_code,
 }
 
 # Per-block-type vertical gap below the block. Tuned for visual rhythm.
@@ -803,6 +858,7 @@ _GAP_AFTER = {
     "progress_bar": 12,
     "heatmap":      16,
     "table":        16,
+    "qr_code":      16,
 }
 
 

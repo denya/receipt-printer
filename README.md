@@ -213,6 +213,20 @@ curl -X POST http://100.78.6.79:9100/print/session \
   -d '{"brand":"CODEX","title":"Repo shipped","results":["Hook installed","Pi updated"]}'
 ```
 
+## QR codes in rich tickets
+
+`/print/rich` now supports a `qr_code` block, so tickets can include a scannable link to the repo or docs.
+
+```bash
+curl -X POST http://100.78.6.79:9100/print/rich \
+  -H 'Content-Type: application/json' \
+  -d '{"blocks":[
+    {"type":"header","title":"README","subtitle":"SCAN ME"},
+    {"type":"title","content":"receipt-printer"},
+    {"type":"qr_code","data":"https://github.com/denya/receipt-printer","label":"github.com/denya/receipt-printer"}
+  ]}'
+```
+
 ## Current improvements in this repo
 
 - Font loading now falls back cleanly outside the container instead of crashing on hardcoded Linux font paths.

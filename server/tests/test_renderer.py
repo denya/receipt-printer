@@ -91,6 +91,17 @@ class RendererTests(unittest.TestCase):
 
         self.assertGreater(long.height, short.height)
 
+    def test_render_qr_code_returns_printable_image(self) -> None:
+        img = renderer.render_qr_code(
+            "https://github.com/denya/receipt-printer",
+            label="github.com/denya/receipt-printer",
+            size=144,
+        )
+
+        self.assertEqual(img.mode, "1")
+        self.assertEqual(img.width, renderer.CONTENT_W)
+        self.assertGreater(img.height, 144)
+
 
 if __name__ == "__main__":
     unittest.main()
