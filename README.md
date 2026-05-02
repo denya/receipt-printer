@@ -13,7 +13,7 @@ Examples:
 <table>
   <tr>
     <td align="center">
-      <img src="./examples/DEMO%20TICKET1.jpeg" alt="README ticket photo" width="260">
+      <img src="./examples/graphics-demo-render.png" alt="Graphics demo render" width="260">
     </td>
     <td align="center">
       <img src="./examples/ALL%20The%20Graphics.jpeg" alt="Graphics ticket photo" width="260">
@@ -24,7 +24,7 @@ Examples:
       <img src="./examples/session-demo-render.png" alt="Session demo render" width="260">
     </td>
     <td align="center">
-      <img src="./examples/graphics-demo-render.png" alt="Graphics demo render" width="260">
+      <img src="./examples/DEMO%20TICKET1.jpeg" alt="README ticket photo" width="260">
     </td>
   </tr>
 </table>
