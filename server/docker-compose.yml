@@ -1,0 +1,28 @@
+# Receipt printer microservice. Reachable from the LAN at
+# http://10.42.40.1:9100/  (host-published port).
+services:
+  printer:
+    build: .
+    image: receipt-printer:latest
+    container_name: receipt-printer
+    restart: unless-stopped
+    devices:
+      # Pass through the kernel usblp device for the Epson TM-T20III.
+      # The container runs as root, so it can open this 660 root:lp node.
+      - /dev/usb/lp0:/dev/usb/lp0
+    ports:
+      # Bind on all interfaces so devices on the 10.42.0.0/16 LAN can hit
+      # this service. Port 9100 chosen per spec; no other process on the
+      # Pi listens here.
+      - "0.0.0.0:9100:9100"
+    environment:
+      - PRINTER_DEVICE=/dev/usb/lp0
+      - PRINTER_WIDTH_CHARS=48
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9100/health', timeout=3).status==200 else 1)\""
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
