@@ -13,9 +13,10 @@ log = logging.getLogger("main")
 
 DEVICE = os.environ.get("PRINTER_DEVICE", "/dev/usb/lp0")
 WIDTH = int(os.environ.get("PRINTER_WIDTH_CHARS", "48"))
+DRY_RUN = os.environ.get("PRINTER_DRY_RUN", "").lower() in {"1", "true", "yes", "on"}
 
 app = FastAPI(title="Receipt Printer", version="2.0.0")
-printer = PrinterService(device=DEVICE, width_chars=WIDTH)
+printer = PrinterService(device=DEVICE, width_chars=WIDTH, dry_run=DRY_RUN)
 
 
 @app.get("/health")

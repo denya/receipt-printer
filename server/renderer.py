@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import datetime
 import math
+import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
@@ -34,9 +35,35 @@ CANVAS_WIDTH = 576
 PAD_X = 36
 CONTENT_W = CANVAS_WIDTH - 2 * PAD_X
 
-FONT_REGULAR = "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
-FONT_BOLD    = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
-FONT_MONO    = "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf"
+FONT_REGULAR = (
+    os.environ.get("RECEIPT_FONT_REGULAR"),
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/Library/Fonts/Arial Unicode.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "LiberationSans-Regular.ttf",
+    "DejaVuSans.ttf",
+    "Arial.ttf",
+)
+FONT_BOLD = (
+    os.environ.get("RECEIPT_FONT_BOLD"),
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/Library/Fonts/Arial Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    "LiberationSans-Bold.ttf",
+    "DejaVuSans-Bold.ttf",
+    "Arial Bold.ttf",
+)
+FONT_MONO = (
+    os.environ.get("RECEIPT_FONT_MONO"),
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/System/Library/Fonts/Supplemental/Courier New.ttf",
+    "LiberationMono-Regular.ttf",
+    "DejaVuSansMono.ttf",
+    "Courier New.ttf",
+)
 
 # +1 pt across the board vs prior version.
 FS_BRAND    = 45
@@ -50,24 +77,31 @@ FS_CAPTION  = 18
 
 # ---------- helpers ----------
 
-_FONT_CACHE: Dict[Tuple[str, int], ImageFont.FreeTypeFont] = {}
+_FONT_CACHE: Dict[Tuple[Tuple[str, ...], int], ImageFont.ImageFont] = {}
 
 
-def _font(path: str, size: int) -> ImageFont.FreeTypeFont:
-    key = (path, size)
+def _font(candidates: Sequence[Optional[str]], size: int) -> ImageFont.ImageFont:
+    key = (tuple(c for c in candidates if c), size)
     if key not in _FONT_CACHE:
-        _FONT_CACHE[key] = ImageFont.truetype(path, size=size)
+        for candidate in key[0]:
+            try:
+                _FONT_CACHE[key] = ImageFont.truetype(candidate, size=size)
+                break
+            except OSError:
+                continue
+        else:
+            _FONT_CACHE[key] = ImageFont.load_default()
     return _FONT_CACHE[key]
 
 
 def _measure(draw: ImageDraw.ImageDraw, text: str,
-             font: ImageFont.FreeTypeFont) -> Tuple[int, int]:
+             font: ImageFont.ImageFont) -> Tuple[int, int]:
     bbox = draw.textbbox((0, 0), text, font=font)
     return bbox[2] - bbox[0], bbox[3] - bbox[1]
 
 
 def _wrap(draw: ImageDraw.ImageDraw, text: str,
-          font: ImageFont.FreeTypeFont, max_width: int) -> List[str]:
+          font: ImageFont.ImageFont, max_width: int) -> List[str]:
     out: List[str] = []
     for paragraph in (text or "").split("\n"):
         if not paragraph:
@@ -499,9 +533,27 @@ def render_table(headers: List[str],
         return Image.new("1", (width, 1), 1)
     col_w = width // n_cols
     pad = 8
-    row_h = FS_CAPTION + 14
+    min_row_h = FS_CAPTION + 14
+    body_line_h = int(_measure(ImageDraw.Draw(Image.new("L", (1, 1), 255)),
+                               "Mg", f_r)[1] * 1.25)
+    header_h = max(min_row_h, int(_measure(
+        ImageDraw.Draw(Image.new("L", (1, 1), 255)), "Mg", f_h)[1] * 1.25) + 10)
     title_h = (FS_BODY + 10) if title else 0
-    height = title_h + row_h * (len(rows) + 1) + 4
+
+    wrapped_rows: List[Tuple[List[List[str]], int]] = []
+    for row in rows:
+        wrapped_cells: List[List[str]] = []
+        max_lines = 1
+        for ci in range(n_cols):
+            cell = str(row[ci]) if ci < len(row) else ""
+            lines = _wrap(ImageDraw.Draw(Image.new("L", (1, 1), 255)),
+                          cell, f_r, col_w - 2 * pad) or [""]
+            wrapped_cells.append(lines)
+            max_lines = max(max_lines, len(lines))
+        row_h = max(min_row_h, max_lines * body_line_h + 10)
+        wrapped_rows.append((wrapped_cells, row_h))
+
+    height = title_h + header_h + 4 + sum(row_h for _, row_h in wrapped_rows)
 
     img = Image.new("L", (width, height), 255)
     draw = ImageDraw.Draw(img)
@@ -511,16 +563,15 @@ def render_table(headers: List[str],
     y = title_h
     for ci, h in enumerate(headers):
         draw.text((ci * col_w + pad, y + 4), str(h), font=f_h, fill=0)
-    y += row_h
+    y += header_h
     draw.line((0, y - 1, width - 1, y - 1), fill=0, width=2)
 
-    for row in rows:
+    for wrapped_cells, row_h in wrapped_rows:
         for ci in range(n_cols):
-            cell = str(row[ci]) if ci < len(row) else ""
-            wrapped = _wrap(draw, cell, f_r, col_w - 2 * pad)
-            if wrapped:
-                draw.text((ci * col_w + pad, y + 4),
-                          wrapped[0], font=f_r, fill=0)
+            cell_y = y + 4
+            for line in wrapped_cells[ci]:
+                draw.text((ci * col_w + pad, cell_y), line, font=f_r, fill=0)
+                cell_y += body_line_h
         y += row_h
         draw.line((0, y - 1, width - 1, y - 1), fill=0, width=1)
     return _to_bw_text(img)
@@ -802,15 +853,17 @@ def render_blocks(blocks: List[Dict[str, Any]]) -> Image.Image:
 # SESSION PRESET (legacy /print/session shim)
 # ============================================================
 
-def render_session(title: str,
+def render_session(brand: str,
+                   title: str,
                    results: List[str],
                    model: Optional[str],
                    turns: Optional[int],
                    duration: Optional[str],
                    timestamp: Optional[str]) -> Image.Image:
     ts = timestamp or datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    header_title = (brand or "CLAUDE").strip().upper()[:20]
     blocks: List[Dict[str, Any]] = [
-        {"type": "header", "title": "CLAUDE",
+        {"type": "header", "title": header_title,
          "subtitle": "TASK COMPLETED", "logo": True},
         {"type": "title", "content": title},
     ]
@@ -820,7 +873,7 @@ def render_session(title: str,
 
     parts: List[str] = []
     if model:
-        parts.append(model.replace("claude-", "").strip())
+        parts.append(model.replace("claude-", "").replace("gpt-", "").strip())
     if turns is not None:
         parts.append(f"{turns} turn{'s' if turns != 1 else ''}")
     if duration:

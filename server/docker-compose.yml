@@ -6,6 +6,8 @@ services:
     image: receipt-printer:latest
     container_name: receipt-printer
     restart: unless-stopped
+    env_file:
+      - .env
     devices:
       # Pass through the kernel usblp device for the Epson TM-T20III.
       # The container runs as root, so it can open this 660 root:lp node.
@@ -16,8 +18,9 @@ services:
       # Pi listens here.
       - "0.0.0.0:9100:9100"
     environment:
-      - PRINTER_DEVICE=/dev/usb/lp0
-      - PRINTER_WIDTH_CHARS=48
+      - PRINTER_DEVICE=${PRINTER_DEVICE:-/dev/usb/lp0}
+      - PRINTER_WIDTH_CHARS=${PRINTER_WIDTH_CHARS:-48}
+      - PRINTER_DRY_RUN=${PRINTER_DRY_RUN:-0}
     healthcheck:
       test:
         - "CMD-SHELL"

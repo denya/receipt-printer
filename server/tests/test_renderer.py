@@ -1,0 +1,96 @@
+import pathlib
+import unittest
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+import sys
+sys.path.insert(0, str(ROOT))
+
+import renderer
+
+
+class RendererTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._orig_regular = renderer.FONT_REGULAR
+        self._orig_bold = renderer.FONT_BOLD
+        self._orig_mono = renderer.FONT_MONO
+        renderer._FONT_CACHE.clear()
+
+    def tearDown(self) -> None:
+        renderer.FONT_REGULAR = self._orig_regular
+        renderer.FONT_BOLD = self._orig_bold
+        renderer.FONT_MONO = self._orig_mono
+        renderer._FONT_CACHE.clear()
+
+    def test_render_session_survives_missing_system_fonts(self) -> None:
+        renderer.FONT_REGULAR = ("definitely-missing-regular.ttf",)
+        renderer.FONT_BOLD = ("definitely-missing-bold.ttf",)
+        renderer.FONT_MONO = ("definitely-missing-mono.ttf",)
+
+        img = renderer.render_session(
+            brand="CLAUDE",
+            title="Deploy receipt printer",
+            results=["Reviewed code", "Fixed renderer fallback"],
+            model="claude-opus-4-7",
+            turns=8,
+            duration="4m 21s",
+            timestamp="2026-05-02 13:30",
+        )
+
+        self.assertEqual(img.mode, "1")
+        self.assertEqual(img.width, renderer.CANVAS_WIDTH)
+        self.assertGreater(img.height, 1)
+
+    def test_render_session_brand_changes_output(self) -> None:
+        claude = renderer.render_session(
+            brand="CLAUDE",
+            title="Deploy receipt printer",
+            results=["Reviewed code"],
+            model="claude-opus-4-7",
+            turns=8,
+            duration="4m 21s",
+            timestamp="2026-05-02 13:30",
+        )
+        codex = renderer.render_session(
+            brand="CODEX",
+            title="Deploy receipt printer",
+            results=["Reviewed code"],
+            model="gpt-5.4",
+            turns=8,
+            duration="4m 21s",
+            timestamp="2026-05-02 13:30",
+        )
+
+        self.assertNotEqual(claude.tobytes(), codex.tobytes())
+
+    def test_render_blocks_error_tag_works_without_custom_fonts(self) -> None:
+        renderer.FONT_REGULAR = ("definitely-missing-regular.ttf",)
+        renderer.FONT_BOLD = ("definitely-missing-bold.ttf",)
+
+        img = renderer.render_blocks([
+            {"type": "heatmap", "matrix": [["not-a-number"]]},
+        ])
+
+        self.assertEqual(img.mode, "1")
+        self.assertEqual(img.width, renderer.CANVAS_WIDTH)
+        self.assertGreater(img.height, 1)
+
+    def test_render_table_expands_for_wrapped_cells(self) -> None:
+        short = renderer.render_table(
+            headers=["Name", "Notes"],
+            rows=[["Printer", "Ready"]],
+        )
+        long = renderer.render_table(
+            headers=["Name", "Notes"],
+            rows=[[
+                "Printer",
+                "This row should wrap across multiple lines instead of "
+                "silently truncating after the first one.",
+            ]],
+        )
+
+        self.assertGreater(long.height, short.height)
+
+
+if __name__ == "__main__":
+    unittest.main()

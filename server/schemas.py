@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 class SessionTicket(BaseModel):
     """A "Claude session completed" ticket — the workhorse format."""
+    brand: str = Field("CLAUDE", min_length=1, max_length=40)
     title: str = Field(..., min_length=1, max_length=200)
     results: List[str] = Field(default_factory=list, max_length=20)
     duration: Optional[str] = Field(None, max_length=40)

@@ -184,7 +184,7 @@ def should_print() -> bool:
 if not should_print():
     sys.exit(0)
 
-payload = {"title": title}
+payload = {"brand": "CLAUDE", "title": title}
 if results: payload["results"] = results
 if duration: payload["duration"] = duration
 if model: payload["model"] = model[:40]

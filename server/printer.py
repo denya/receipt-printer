@@ -27,15 +27,41 @@ import renderer
 log = logging.getLogger("printer")
 
 
+class _DryRunPrinter:
+    def text(self, _: str) -> None:
+        pass
+
+    def cut(self) -> None:
+        pass
+
+    def set(self, **_: Any) -> None:
+        pass
+
+    def image(self, _: Image.Image, **__: Any) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
 class PrinterService:
-    def __init__(self, device: str, width_chars: int):
+    def __init__(self, device: str, width_chars: int, dry_run: bool = False):
         self.device = device
         self.width = max(20, int(width_chars))
+        self.dry_run = dry_run
         self._lock = asyncio.Lock()
 
     # ---------- public API ----------
 
     async def health(self) -> Dict[str, Any]:
+        if self.dry_run:
+            return {
+                "ok": True,
+                "device": self.device,
+                "device_mode": "dry_run",
+                "width_chars": self.width,
+                "dry_run": True,
+            }
         try:
             st = os.stat(self.device)
         except FileNotFoundError:
@@ -69,6 +95,7 @@ class PrinterService:
 
     async def print_session(self, ticket) -> Dict[str, Any]:
         img = renderer.render_session(
+            brand=ticket.brand,
             title=ticket.title,
             results=list(ticket.results or []),
             model=ticket.model,
@@ -109,6 +136,9 @@ class PrinterService:
             await asyncio.to_thread(self._open_and_run, job)
 
     def _open_and_run(self, job: Callable[[Any], None]) -> None:
+        if self.dry_run:
+            job(_DryRunPrinter())
+            return
         # Re-open per job — cheap, avoids stale state and fd leaks.
         printer = File(self.device, auto_flush=True)
         try:
