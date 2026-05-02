@@ -1,26 +1,39 @@
 #!/usr/bin/env bash
-# SessionEnd hook → POST a session ticket to the home receipt printer.
+# Stop hook → POST a session ticket to the home receipt printer
+# whenever the assistant has just delivered a real task completion.
+#
+# Why Stop, not SessionEnd:
+# - SessionEnd only fires when the user explicitly ends the session
+#   (clear/exit/logout). Closing-the-laptop-mid-task triggers a print;
+#   ordinary "I finished a task, let's keep working" does not.
+# - Stop fires after every assistant turn, so we can decide PER TURN
+#   whether THIS turn is a real completion. The cheap Haiku verifier is
+#   the source of truth.
 #
 # Behavior:
-# - Reads the Claude SessionEnd event JSON from stdin.
-# - Parses the transcript file to extract the first user message,
-#   last assistant turns, model, turn count, and duration.
-# - Filters out sessions that ended mid-conversation (assistant asking
-#   a question, presenting a plan, awaiting confirmation) via a local
-#   heuristic on the last assistant turn — these never produce a receipt
-#   regardless of how much work happened earlier.
-# - For sessions that pass the local filter, asks Claude Haiku
-#   (claude-haiku-4-5-20251001) whether the session reached a real
-#   completion vs trivial / aborted / exploratory work.
-# - On "PRINT", POSTs the ticket to the home receipt printer.
+# - Reads the Claude Stop event JSON from stdin.
+# - Parses the transcript and pulls the LATEST assistant turn.
+# - Local pre-filter: skip without burning API tokens if the latest
+#   turn ends with "?" or contains explicit asking/planning phrases
+#   ("Should I…", "Want me to…", "Here's the plan", etc.).
+# - Dedup by per-session message-hash in a JSON state file — the same
+#   completion turn is never reprinted (the Stop hook will fire again
+#   if the user types another short ack like "thanks", but Haiku will
+#   say SKIP for that turn).
+# - Calls Claude Haiku (claude-haiku-4-5-20251001) with a per-turn
+#   decision prompt: PRINT only when this turn is a concrete completed
+#   outcome and not awaiting user input.
+# - On PRINT: POSTs the ticket and records the dedup state.
 # - All failures are silent: a missing/unreachable printer or API must
-#   never block Claude Code.
+#   never block Claude Code (Stop hooks must exit 0).
 #
 # Optional env vars (graceful fallback when absent):
-#   ANTHROPIC_API_KEY   API key for the Haiku filter call.
-#                       If unset, the hook prints every session (legacy mode).
-#   PRINTER_URL         Override the printer endpoint. Defaults below.
-#   PRINT_FILTER        "off"   — bypass filter, print everything.
+#   ANTHROPIC_API_KEY   API key for the Haiku verifier. WITHOUT IT THE
+#                       HOOK DOES NOT PRINT — per-turn firing means we
+#                       cannot safely default-print without verification.
+#   PRINTER_URL         Override the printer endpoint. Default below.
+#   PRINT_FILTER        "off"   — bypass filter, print every turn that
+#                                 passes the local pre-filter + dedup.
 #                       "force" — same as "off".
 #                       (default) — Haiku decides.
 
@@ -28,18 +41,33 @@ set -e
 
 PRINTER_URL="${PRINTER_URL:-http://100.78.6.79:9100/print/session}"
 FILTER_MODEL="claude-haiku-4-5-20251001"
+STATE_PATH="${HOME}/.claude/hooks/print-stop-state.json"
 
 event="$(cat || true)"
 
 transcript_path="$(printf '%s' "$event" | jq -r '.transcript_path // empty' 2>/dev/null || true)"
 session_id="$(printf '%s' "$event" | jq -r '.session_id // empty' 2>/dev/null || true)"
 cwd="$(printf '%s' "$event" | jq -r '.cwd // empty' 2>/dev/null || true)"
-end_reason="$(printf '%s' "$event" | jq -r '.reason // empty' 2>/dev/null || true)"
+stop_hook_active="$(printf '%s' "$event" | jq -r '.stop_hook_active // empty' 2>/dev/null || true)"
 
-python3 - "$transcript_path" "$session_id" "$cwd" "$PRINTER_URL" "$FILTER_MODEL" "$end_reason" <<'PY' >/dev/null 2>&1 || true
-import json, os, sys, urllib.request, datetime, re
+python3 - "$transcript_path" "$session_id" "$cwd" "$PRINTER_URL" "$FILTER_MODEL" "$STATE_PATH" "$stop_hook_active" <<'PY' >/dev/null 2>&1 || true
+import datetime
+import hashlib
+import json
+import os
+import re
+import sys
+import urllib.request
 
-transcript, session_id, cwd, url, filter_model, end_reason = sys.argv[1:7]
+(
+    transcript,
+    session_id,
+    cwd,
+    url,
+    filter_model,
+    state_path,
+    stop_hook_active,
+) = sys.argv[1:8]
 
 title = "Claude session"
 results = []
@@ -95,6 +123,11 @@ if transcript and os.path.exists(transcript):
         title = first_user_text[:120]
     results = [t[:120] for t in last_assistant_texts[-3:]]
 
+# Need at least one assistant turn to have something to evaluate.
+if not last_assistant_texts:
+    sys.exit(0)
+last_assistant = last_assistant_texts[-1]
+
 duration = None
 if first_ts and last_ts:
     try:
@@ -108,10 +141,7 @@ if first_ts and last_ts:
     except Exception:
         pass
 
-# ---- Mid-conversation detection ---------------------------------------
-# Sessions that END in the middle of a conversation (assistant asking a
-# question, presenting a plan for approval, requesting clarification) are
-# NOT completed tasks and should not produce a receipt.
+# ---- Mid-conversation pre-filter (cheap, no API call) -----------------
 MID_CONVERSATION_PATTERNS = (
     "should i ", "shall i ", "shall we ", "want me to", "would you like",
     "do you want", "let me know if", "let me know whether", "let me know which",
@@ -127,96 +157,116 @@ MID_CONVERSATION_PATTERNS = (
 )
 
 def looks_like_mid_conversation(text: str) -> bool:
-    """Heuristic: does the LAST assistant message indicate the session
-    ended mid-task — asking the user a question, presenting a plan, or
-    awaiting confirmation? If so, no receipt regardless of earlier work.
-    """
+    """The latest assistant turn is asking a question, presenting a plan,
+    or otherwise awaiting input. Not a completion."""
     if not text:
         return False
     t = text.strip()
-    # Any assistant message that ends with a question mark is asking the
-    # user something — not a completion. (False positives on rhetorical
-    # closing questions are rare and acceptable.)
     if t.endswith("?"):
         return True
-    # Check the trailing chunk for explicit asking phrases.
     tail = t[-400:].lower()
     for pat in MID_CONVERSATION_PATTERNS:
         if pat in tail:
             return True
     return False
 
-# ---- Haiku filter: should we print this receipt? ----------------------
-def should_print() -> bool:
-    """Decide whether this session is a completed task worth printing.
+if looks_like_mid_conversation(last_assistant):
+    sys.exit(0)
 
-    Returns True if printing should proceed. Defaults to True on any
-    error, missing API key, or PRINT_FILTER=off — so missing config never
-    causes a silent loss of printouts.
-    """
+# ---- Dedup state -------------------------------------------------------
+# Stop fires after every assistant turn. If the user keeps the session
+# open after a completion, the next short ack ("thanks", "what next?")
+# would also Stop — but Haiku will SKIP those, so this is mainly defense
+# in depth. The hash key prevents reprinting the IDENTICAL turn (e.g.
+# if a hook retry runs).
+def msg_hash(text: str) -> str:
+    return hashlib.sha256(text[-2000:].encode("utf-8", errors="replace")).hexdigest()
+
+def load_state() -> dict:
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("sessions"), dict):
+                return data
+    except Exception:
+        pass
+    return {"sessions": {}}
+
+def save_state(state: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        sessions = state.get("sessions", {})
+        # LRU bound at 100 sessions to keep the file tiny.
+        if len(sessions) > 100:
+            ordered = sorted(sessions.items(), key=lambda kv: kv[1].get("updated", ""))
+            state["sessions"] = dict(ordered[-100:])
+        tmp = state_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp, state_path)
+    except Exception:
+        pass
+
+current_hash = msg_hash(last_assistant)
+state = load_state()
+session_key = session_id or "_unknown"
+sess_state = state.get("sessions", {}).get(session_key, {})
+if sess_state.get("last_printed_hash") == current_hash:
+    # Already printed THIS exact turn — nothing new.
+    sys.exit(0)
+
+# ---- Haiku decision (the reliable verdict) ----------------------------
+def haiku_says_print() -> bool:
     mode = os.environ.get("PRINT_FILTER", "").lower()
     if mode in ("off", "force"):
         return True
 
-    # Cheap local pre-filter — skip obvious noise without burning API cost.
-    if turns < 2:
-        return False
-    if not first_user_text and not last_assistant_texts:
-        return False
-
-    # Hard skip: last assistant turn is clearly a question or plan-for-
-    # approval. This means the session ended mid-conversation, which is
-    # never a completion regardless of how much work happened earlier.
-    last_assistant = last_assistant_texts[-1] if last_assistant_texts else ""
-    if looks_like_mid_conversation(last_assistant):
-        return False
-
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        return True  # legacy: print everything when no key configured
+        # Per-turn firing: without Haiku we can't reliably distinguish
+        # completions from interim turns, so we DON'T print. Set the
+        # API key (or PRINT_FILTER=off) to enable receipts.
+        return False
 
     sample = {
         "first_user_message": (first_user_text or "")[:600],
-        "last_assistant_turn": last_assistant[:1200],
+        "latest_assistant_turn": last_assistant[:1500],
         "previous_assistant_turns": [t[:300] for t in last_assistant_texts[-4:-1]],
-        "turns": turns,
+        "turns_so_far": turns,
         "duration": duration,
         "cwd": cwd,
-        "session_end_reason": end_reason or None,
     }
 
     system = (
-        "You decide whether a Claude Code session deserves a paper receipt "
-        "printed at home. Sessions end for many reasons: real completion, but "
-        "also user quitting mid-task, asking the assistant a question and "
-        "leaving, or pausing to think. Your job: distinguish a FINISHED task "
-        "from one that ended MID-CONVERSATION.\n\n"
-        "Reply PRINT only when the LAST assistant turn shows the assistant "
-        "delivered a concrete completed outcome and is NOT awaiting user "
-        "input on next steps. Strong PRINT signals in the last turn:\n"
-        "- Code committed/pushed with hash, PR/branch/file paths\n"
+        "You decide whether the assistant's MOST RECENT turn in a Claude "
+        "Code session is a real task completion worth printing on a paper "
+        "receipt at home. This hook fires after every assistant turn, so "
+        "the vast majority of turns are interim and must be SKIPPED.\n\n"
+        "Reply PRINT only when the LATEST assistant turn shows the "
+        "assistant has DELIVERED a concrete completed outcome and is NOT "
+        "awaiting user input on next steps. Strong PRINT signals:\n"
+        "- Code committed/pushed (commit hash, PR/branch, file paths)\n"
         "- Bug fix verified (tests pass, behavior confirmed)\n"
         "- Deployment completed (service healthy, container running)\n"
         "- File created/modified with summary of what changed\n"
         "- Investigation/analysis with concrete conclusions delivered\n"
-        "- Final wrap-up summary of what was accomplished this session\n\n"
-        "Reply SKIP when the LAST assistant turn shows the session ended "
-        "mid-conversation. Strong SKIP signals in the last turn:\n"
-        "- Asks the user a question (ends with '?', 'Should I…', 'Want me to…')\n"
-        "- Presents a plan and waits for approval ('Here's the plan:', 'Ready?')\n"
-        "- Requests clarification ('What did you mean…', 'Could you confirm…')\n"
-        "- Offers options for the user to choose between\n"
-        "- Aborted/partial work, dead-end debugging without a fix\n"
-        "- Trivial Q&A or single-step lookup\n"
-        "- Pure exploration with no concrete deliverable\n\n"
-        "PRIORITY RULE: if the LAST assistant turn is asking, planning, "
-        "or awaiting input — reply SKIP, even if earlier turns shipped real "
-        "work. The session is not over for the user yet.\n\n"
+        "- Final wrap-up summary of what was accomplished\n\n"
+        "Reply SKIP for everything else, especially:\n"
+        "- Asks the user a question (ends with '?', 'Should I…')\n"
+        "- Presents a plan and waits for approval ('Here's the plan:')\n"
+        "- Requests clarification or offers options to choose between\n"
+        "- Interim progress: 'Checking…', 'I'll now…', 'Reading file…'\n"
+        "- Partial work, dead-end debugging without a fix\n"
+        "- Trivial Q&A or single-step lookup with no real deliverable\n"
+        "- Pure exploration / research without a concrete outcome\n\n"
+        "PRIORITY RULE: when in doubt, SKIP. A missed receipt is fine; "
+        "a spurious receipt is annoying. Only PRINT when the turn clearly "
+        "marks a logical task endpoint.\n\n"
         "Reply with EXACTLY one token: PRINT or SKIP."
     )
 
     user = (
-        "Decide PRINT or SKIP for this session:\n\n"
+        "Decide PRINT or SKIP for this turn:\n\n"
         + json.dumps(sample, ensure_ascii=False, indent=2)
     )
 
@@ -241,20 +291,23 @@ def should_print() -> bool:
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except Exception:
-        return True  # network/API error → fall back to printing
+        # Network/API error: be conservative, do NOT print spurious receipts.
+        return False
 
     text = ""
     for blk in data.get("content", []):
         if isinstance(blk, dict) and blk.get("type") == "text":
             text += blk.get("text", "")
     verdict = text.strip().upper()
-    # Be permissive: only an explicit SKIP suppresses the print.
-    return "SKIP" not in verdict.split()
+    # Strict: explicit PRINT and no SKIP.
+    tokens = verdict.split()
+    return "PRINT" in tokens and "SKIP" not in tokens
 
-if not should_print():
+if not haiku_says_print():
     sys.exit(0)
 
-payload = {"brand": "CLAUDE", "title": title}
+# ---- POST receipt + record dedup state -------------------------------
+payload = {"title": title}
 if results: payload["results"] = results
 if duration: payload["duration"] = duration
 if model: payload["model"] = model[:40]
@@ -262,7 +315,18 @@ if turns: payload["turns"] = turns
 
 data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-urllib.request.urlopen(req, timeout=4).read()
+try:
+    urllib.request.urlopen(req, timeout=4).read()
+except Exception:
+    # Print failed; don't record dedup so the next Stop can retry.
+    sys.exit(0)
+
+# Record dedup AFTER successful POST so retries can recover.
+state.setdefault("sessions", {})[session_key] = {
+    "last_printed_hash": current_hash,
+    "updated": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+}
+save_state(state)
 PY
 
 exit 0
