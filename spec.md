@@ -87,6 +87,7 @@ fighting libusb for the interface — much more reliable on this device.
 
 ```python
 class SessionTicket(BaseModel):
+    brand:     str = "CLAUDE"            # header label, e.g. CLAUDE / CODEX / README
     title:     str                        # 1..200 chars, required
     results:   list[str] = []             # up to 20 bullets, each shown verbatim
     duration:  str | None = None          # e.g. "6m 04s"
@@ -131,8 +132,8 @@ device file is reopened per job (cheap, avoids stale fd state).
 
 Blocks are validated permissively as plain dicts; the renderer dispatches
 on `type`. Unknown types fall back to body text. Catalogued in `SKILL.md`:
-`header`, `title`, `text` (styles: body/meta/dim), `bullets`, `bar_chart`,
-`sparkline`, `ornament`, `table`, etc.
+`header`, `title`, `text`, `bullets`, `bar_chart`, `sparkline`, `pie_chart`,
+`progress_bar`, `heatmap`, `table`, `qr_code`, etc.
 
 ### Container
 
@@ -142,7 +143,8 @@ on `type`. Unknown types fall back to body text. Catalogued in `SKILL.md`:
 - `restart: unless-stopped`.
 - Bind-mounts `/dev/usb/lp0` from host into the container.
 - Publishes `0.0.0.0:9100:9100` so devices on the LAN and Tailnet can hit it.
-- Env: `PRINTER_DEVICE=/dev/usb/lp0`, `PRINTER_WIDTH_CHARS=48`.
+- Env: `PRINTER_DEVICE=/dev/usb/lp0`, `PRINTER_WIDTH_CHARS=48`,
+  `PRINTER_DRY_RUN=0`.
 - Healthcheck: `urllib.request.urlopen('http://127.0.0.1:9100/health')`,
   every 30s, 5s timeout, 3 retries, 15s start period.
 
@@ -152,7 +154,7 @@ on `type`. Unknown types fall back to body text. Catalogued in `SKILL.md`:
 - apt: `libusb-1.0-0` (kept in case we ever switch to the Usb backend),
   `ca-certificates`, `fonts-liberation`, `fonts-dejavu-core`.
 - pip: `requirements.txt` (FastAPI 0.115.6, uvicorn 0.32.1,
-  python-escpos 3.1, pydantic 2.10.3).
+  python-escpos 3.1, pydantic 2.10.3, qrcode 8.2).
 - Runs as root (needed to open the `660 root:lp` device node).
 - `CMD uvicorn main:app --host 0.0.0.0 --port 9100`.
 

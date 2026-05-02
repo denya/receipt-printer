@@ -14,6 +14,7 @@ The current live target is the Raspberry Pi at `100.78.6.79`, where the standalo
 ```text
 receipt-printer/
 ├── README.md
+├── examples/
 ├── spec.md
 ├── client/
 │   └── print-session.sh
@@ -28,6 +29,18 @@ receipt-printer/
     ├── schemas.py
     └── tests/
 ```
+
+## Example tickets
+
+Physical ticket photo:
+
+![README showcase photo](./examples/readme-showcase-photo.jpeg)
+
+Renderer output examples:
+
+![Session demo render](./examples/session-demo-render.png)
+
+![Graphics demo render](./examples/graphics-demo-render.png)
 
 ## What the server exposes
 
@@ -47,101 +60,36 @@ curl -X POST http://100.78.6.79:9100/print/session \
   -d '{"brand":"CLAUDE","title":"Shipped fix","results":["Reviewed code","Patched bug"]}'
 ```
 
-## Local development
+## How To Install
 
-Create a virtualenv and install the server dependencies:
+Start by choosing the mode that matches what you actually want.
 
-```bash
-cd server
-python3 -m venv ../.venv
-. ../.venv/bin/activate
-pip install -r requirements.txt
-```
+| Goal | What you install | Hook wiring |
+|---|---|---|
+| You already have a printer server somewhere and only want to print nice reports manually | client-side commands only | no |
+| You already have a printer server somewhere and want automatic Claude/Codex session receipts | client-side commands + optional hooks | yes |
+| You want to run your own printer server | `server/` on a Pi/Linux box, then optional clients | optional |
+| You are on one MacBook and just want to experiment, preview layouts, or manually trigger reports | local dry-run server or an existing remote server | no by default |
 
-Run the tests:
+### 1. Manual use against an existing printer server
 
-```bash
-. ../.venv/bin/activate
-python -m unittest discover -s tests -v
-```
-
-### Run the API without a real printer
-
-Use dry-run mode. It exercises the full render path but skips writing to `/dev/usb/lp0`.
+This is the simplest path. No hook wiring, no automatic printing, just manual report printing when you want it.
 
 ```bash
-cd server
-cp .env.example .env
-sed -i.bak 's/PRINTER_DRY_RUN=0/PRINTER_DRY_RUN=1/' .env
-docker compose up --build
-```
-
-Or without Docker:
-
-```bash
-cd server
-PRINTER_DRY_RUN=1 uvicorn main:app --host 127.0.0.1 --port 9100
-```
-
-Then:
-
-```bash
-curl http://127.0.0.1:9100/health
-curl -X POST http://127.0.0.1:9100/print/session \
+export PRINTER_URL="http://100.78.6.79:9100"
+curl "$PRINTER_URL/health"
+curl -X POST "$PRINTER_URL/print/session" \
   -H 'Content-Type: application/json' \
-  -d '{"title":"Dry run","results":["No printer needed"]}'
+  -d '{"brand":"README","title":"Manual print","results":["Manual mode is enough for many users"]}'
 ```
 
-## Raspberry Pi deployment
+For richer layouts, use `/print/rich` and build the ticket out of blocks. The contract for that lives in [server/SKILL.md](./server/SKILL.md).
 
-The standalone service on the Pi is not a git checkout. The deployable files in `server/` are copied into:
+### 2. Optional hook wiring for automatic session receipts
 
-```text
-/home/denya/receipt-printer-service/
-```
+Only do this if you explicitly want Claude Code or Codex to print automatically after useful sessions. If you only want manual reports, stop after step 1.
 
-### First-time setup on the Pi
-
-```bash
-ssh denya@100.78.6.79
-mkdir -p /home/denya/receipt-printer-service
-cd /home/denya/receipt-printer-service
-cp .env.example .env
-docker compose up -d --build
-```
-
-Recommended `.env`:
-
-```dotenv
-PRINTER_DEVICE=/dev/usb/lp0
-PRINTER_WIDTH_CHARS=48
-PRINTER_DRY_RUN=0
-```
-
-### Update the Pi deployment
-
-Copy the standalone server files from this repo to the Pi, preserving `.env`:
-
-```bash
-rsync -av \
-  --exclude '__pycache__/' \
-  --exclude '.env' \
-  ./server/ denya@100.78.6.79:/home/denya/receipt-printer-service/
-```
-
-Then rebuild and verify:
-
-```bash
-ssh denya@100.78.6.79 '
-  cd /home/denya/receipt-printer-service &&
-  docker compose up -d --build &&
-  curl -sf http://127.0.0.1:9100/health
-'
-```
-
-## Claude Code hook
-
-Install the hook locally:
+#### Claude Code
 
 ```bash
 mkdir -p ~/.claude/hooks
@@ -168,23 +116,15 @@ Example `~/.claude/settings.json` snippet:
 }
 ```
 
-Useful env vars for the hook:
+Useful env vars:
 
 - `PRINTER_URL` — defaults to `http://100.78.6.79:9100/print/session`
 - `ANTHROPIC_API_KEY` — enables the Haiku print-worthiness filter
 - `PRINT_FILTER=off` — bypasses the filter and prints every session
 
-## Codex hook
+#### Codex
 
-Codex does not have the same session-end hook surface here. The practical hook point is the global `notify` command that fires after each completed agent turn.
-
-This repo includes [client/print-codex-notify.py](/Users/denya/code/random-vibe-coding/receipt-printer/client/print-codex-notify.py:1), which:
-
-- receives the Codex notify payload
-- prints only high-value final-looking turns
-- then chains to the existing oh-my-codex notify hook so current notifications keep working
-
-Install it:
+Codex does not expose the same session-end hook here. The practical surface is the global `notify` callback after each completed turn.
 
 ```bash
 mkdir -p ~/.codex/hooks
@@ -193,13 +133,109 @@ chmod +x ~/.codex/hooks/print-codex-notify.py
 cp ~/.codex/config.toml ~/.codex/config.toml.bak-receipt-hook
 ```
 
-Then change the `notify = [...]` entry in `~/.codex/config.toml` so `--previous-notify` points at:
+Then change `notify = [...]` in `~/.codex/config.toml` so `--previous-notify` points at:
 
 ```json
 ["/Users/denya/.codex/hooks/print-codex-notify.py"]
 ```
 
-The wrapper itself forwards to the existing OMX notify hook, so the old behavior is preserved.
+The wrapper keeps the existing oh-my-codex notify chain intact and only adds printing on top.
+
+### 3. Run your own server
+
+If you want a real physical printer host, the supported path today is a Raspberry Pi or another Linux machine with the Epson exposed as `/dev/usb/lp0`.
+
+The standalone service on the live Pi is deployed into:
+
+```text
+/home/denya/receipt-printer-service/
+```
+
+#### Quick path: use this repo directly
+
+```bash
+git clone https://github.com/denya/receipt-printer.git
+cd receipt-printer/server
+cp .env.example .env
+docker compose up -d --build
+curl -sf http://127.0.0.1:9100/health
+```
+
+Recommended `.env`:
+
+```dotenv
+PRINTER_DEVICE=/dev/usb/lp0
+PRINTER_WIDTH_CHARS=48
+PRINTER_DRY_RUN=0
+```
+
+#### Build-your-own path: use the spec
+
+If you do not want to use this repo directly, [`spec.md`](./spec.md) is the full build-from-scratch contract: architecture, endpoints, request shapes, rendering expectations, hardware assumptions, and deployment order.
+
+Use that path when you want your own implementation but compatible client behavior.
+
+#### Updating a standalone Pi deployment
+
+```bash
+rsync -av \
+  --exclude '__pycache__/' \
+  --exclude '.env' \
+  ./server/ denya@100.78.6.79:/home/denya/receipt-printer-service/
+
+ssh denya@100.78.6.79 '
+  cd /home/denya/receipt-printer-service &&
+  docker compose up -d --build &&
+  curl -sf http://127.0.0.1:9100/health
+'
+```
+
+### 4. Single-machine MacBook mode
+
+If you are on one working MacBook with Claude/Codex and only want to design tickets, test rendering, or manually trigger nice reports, use local dry-run mode.
+
+```bash
+cd server
+python3 -m venv ../.venv
+. ../.venv/bin/activate
+pip install -r requirements.txt
+PRINTER_DRY_RUN=1 uvicorn main:app --host 127.0.0.1 --port 9100
+```
+
+Then in another terminal:
+
+```bash
+curl http://127.0.0.1:9100/health
+curl -X POST http://127.0.0.1:9100/print/session \
+  -H 'Content-Type: application/json' \
+  -d '{"brand":"README","title":"Dry run","results":["No physical printer required"]}'
+```
+
+This is the recommended same-laptop mode for README work, layout iteration, and manual ticket experiments.
+
+If you need actual paper output, the current first-class hardware path is still a Linux/Pi printer host. On macOS, the practical setup is usually:
+
+1. Claude/Codex run on the MacBook.
+2. The printer service runs on a Pi or other Linux host.
+3. The MacBook talks to that server over `PRINTER_URL`.
+
+## Local development
+
+Create a virtualenv and install the server dependencies:
+
+```bash
+cd server
+python3 -m venv ../.venv
+. ../.venv/bin/activate
+pip install -r requirements.txt
+```
+
+Run the tests:
+
+```bash
+. ../.venv/bin/activate
+python -m unittest discover -s tests -v
+```
 
 ## Configurable header brand
 

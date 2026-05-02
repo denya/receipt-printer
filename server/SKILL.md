@@ -203,8 +203,8 @@ to fit the print width. Keep matrices ≤ 12 cols for readability.
  "headers": ["File", "+", "-"],
  "rows": [["app.py", "42", "8"], ["util.py", "12", "0"]]}
 ```
-Bold headers, hairline rules between rows. Cells truncate to one line —
-choose short labels.
+Bold headers, hairline rules between rows. Long cells wrap across multiple
+lines, so the block works for brief notes as well as compact metrics.
 
 ### `qr_code`
 ```json
