@@ -20,28 +20,51 @@
 #   completion turn is never reprinted (the Stop hook will fire again
 #   if the user types another short ack like "thanks", but Haiku will
 #   say SKIP for that turn).
-# - Calls Claude Haiku (claude-haiku-4-5-20251001) with a per-turn
-#   decision prompt: PRINT only when this turn is a concrete completed
-#   outcome and not awaiting user input.
+# - Calls Claude Haiku via `claude -p --model claude-haiku-4-5-20251001`
+#   for the per-turn decision. Uses the user's existing Claude Code auth
+#   (Pro/Max subscription or Console) — no separate ANTHROPIC_API_KEY
+#   needed. The verifier subprocess sets RECEIPT_PRINTER_VERIFIER=1 so
+#   the recursive Stop hook fires-and-exits without re-running the work.
 # - On PRINT: POSTs the ticket and records the dedup state.
-# - All failures are silent: a missing/unreachable printer or API must
-#   never block Claude Code (Stop hooks must exit 0).
+# - All failures are silent: a missing/unreachable printer or claude CLI
+#   must never block Claude Code (Stop hooks must exit 0).
 #
 # Optional env vars (graceful fallback when absent):
-#   ANTHROPIC_API_KEY   API key for the Haiku verifier. WITHOUT IT THE
-#                       HOOK DOES NOT PRINT — per-turn firing means we
-#                       cannot safely default-print without verification.
-#   PRINTER_URL         Override the printer endpoint. Default below.
-#   PRINT_FILTER        "off"   — bypass filter, print every turn that
-#                                 passes the local pre-filter + dedup.
-#                       "force" — same as "off".
-#                       (default) — Haiku decides.
+#   PRINTER_URL                 Override the printer endpoint. Default below.
+#   PRINT_FILTER                "off" / "force" — bypass Haiku, print every
+#                                turn that passes the local filter + dedup.
+#                                (default) — Haiku decides.
+#   RECEIPT_PRINTER_VERIFIER    Internal recursion guard. Set to "1" by the
+#                                verifier subprocess so the recursive Stop
+#                                exits immediately. Do NOT set manually.
+#   CLAUDE_BIN                  Override the path to the claude CLI.
+#                                Default: auto-detect via PATH then known dirs.
 
 set -e
+
+# Recursion guard: when this hook calls `claude -p` to verify, the
+# subprocess will itself emit Stop events that re-trigger this hook.
+# The env-var sentinel breaks the loop with a fast exit.
+if [ -n "${RECEIPT_PRINTER_VERIFIER:-}" ]; then
+  exit 0
+fi
 
 PRINTER_URL="${PRINTER_URL:-http://100.78.6.79:9100/print/session}"
 FILTER_MODEL="claude-haiku-4-5-20251001"
 STATE_PATH="${HOME}/.claude/hooks/print-stop-state.json"
+
+# Find claude CLI — Claude Code may launch hooks with a minimal PATH.
+if [ -z "${CLAUDE_BIN:-}" ]; then
+  if command -v claude >/dev/null 2>&1; then
+    CLAUDE_BIN="$(command -v claude)"
+  elif [ -x "$HOME/.local/bin/claude" ]; then
+    CLAUDE_BIN="$HOME/.local/bin/claude"
+  elif [ -x "/usr/local/bin/claude" ]; then
+    CLAUDE_BIN="/usr/local/bin/claude"
+  elif [ -x "/opt/homebrew/bin/claude" ]; then
+    CLAUDE_BIN="/opt/homebrew/bin/claude"
+  fi
+fi
 
 event="$(cat || true)"
 
@@ -50,12 +73,13 @@ session_id="$(printf '%s' "$event" | jq -r '.session_id // empty' 2>/dev/null ||
 cwd="$(printf '%s' "$event" | jq -r '.cwd // empty' 2>/dev/null || true)"
 stop_hook_active="$(printf '%s' "$event" | jq -r '.stop_hook_active // empty' 2>/dev/null || true)"
 
-python3 - "$transcript_path" "$session_id" "$cwd" "$PRINTER_URL" "$FILTER_MODEL" "$STATE_PATH" "$stop_hook_active" <<'PY' >/dev/null 2>&1 || true
+python3 - "$transcript_path" "$session_id" "$cwd" "$PRINTER_URL" "$FILTER_MODEL" "$STATE_PATH" "$stop_hook_active" "${CLAUDE_BIN:-}" <<'PY' >/dev/null 2>&1 || true
 import datetime
 import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.request
 
@@ -67,7 +91,8 @@ import urllib.request
     filter_model,
     state_path,
     stop_hook_active,
-) = sys.argv[1:8]
+    claude_bin,
+) = sys.argv[1:9]
 
 title = "Claude session"
 results = []
@@ -221,11 +246,8 @@ def haiku_says_print() -> bool:
     if mode in ("off", "force"):
         return True
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        # Per-turn firing: without Haiku we can't reliably distinguish
-        # completions from interim turns, so we DON'T print. Set the
-        # API key (or PRINT_FILTER=off) to enable receipts.
+    if not claude_bin or not os.path.exists(claude_bin):
+        # No claude CLI found → can't verify → don't print spurious receipts.
         return False
 
     sample = {
@@ -237,7 +259,9 @@ def haiku_says_print() -> bool:
         "cwd": cwd,
     }
 
-    system = (
+    # System + user prompt baked into a single -p argument. claude -p
+    # treats it as the user message; we phrase the system rules inline.
+    prompt = (
         "You decide whether the assistant's MOST RECENT turn in a Claude "
         "Code session is a real task completion worth printing on a paper "
         "receipt at home. This hook fires after every assistant turn, so "
@@ -262,45 +286,30 @@ def haiku_says_print() -> bool:
         "PRIORITY RULE: when in doubt, SKIP. A missed receipt is fine; "
         "a spurious receipt is annoying. Only PRINT when the turn clearly "
         "marks a logical task endpoint.\n\n"
-        "Reply with EXACTLY one token: PRINT or SKIP."
-    )
-
-    user = (
+        "Reply with EXACTLY one token: PRINT or SKIP. No other text.\n\n"
         "Decide PRINT or SKIP for this turn:\n\n"
         + json.dumps(sample, ensure_ascii=False, indent=2)
     )
 
-    body = json.dumps({
-        "model": filter_model,
-        "max_tokens": 4,
-        "system": system,
-        "messages": [{"role": "user", "content": user}],
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=body,
-        headers={
-            "content-type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-        },
-        method="POST",
-    )
+    # Spawn `claude -p` with the recursion guard. The subprocess will emit
+    # its own Stop event that re-runs THIS hook; the env var makes that
+    # recursion exit instantly at the bash guard above.
+    env = {**os.environ, "RECEIPT_PRINTER_VERIFIER": "1"}
     try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        result = subprocess.run(
+            [claude_bin, "-p", "--model", filter_model, prompt],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=18,
+        )
     except Exception:
-        # Network/API error: be conservative, do NOT print spurious receipts.
         return False
-
-    text = ""
-    for blk in data.get("content", []):
-        if isinstance(blk, dict) and blk.get("type") == "text":
-            text += blk.get("text", "")
-    verdict = text.strip().upper()
-    # Strict: explicit PRINT and no SKIP.
+    if result.returncode != 0:
+        return False
+    verdict = (result.stdout or "").strip().upper()
     tokens = verdict.split()
+    # Strict: explicit PRINT and no SKIP token anywhere in the response.
     return "PRINT" in tokens and "SKIP" not in tokens
 
 if not haiku_says_print():
