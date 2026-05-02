@@ -24,7 +24,8 @@ from __future__ import annotations
 import datetime
 import math
 import os
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+import re
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 import qrcode
@@ -55,6 +56,26 @@ FONT_BOLD = (
     "LiberationSans-Bold.ttf",
     "DejaVuSans-Bold.ttf",
     "Arial Bold.ttf",
+)
+FONT_ITALIC = (
+    os.environ.get("RECEIPT_FONT_ITALIC"),
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Italic.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+    "/Library/Fonts/Arial Italic.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Italic.ttf",
+    "LiberationSans-Italic.ttf",
+    "DejaVuSans-Oblique.ttf",
+    "Arial Italic.ttf",
+)
+FONT_BOLD_ITALIC = (
+    os.environ.get("RECEIPT_FONT_BOLD_ITALIC"),
+    "/usr/share/fonts/truetype/liberation/LiberationSans-BoldItalic.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
+    "/Library/Fonts/Arial Bold Italic.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold Italic.ttf",
+    "LiberationSans-BoldItalic.ttf",
+    "DejaVuSans-BoldOblique.ttf",
+    "Arial Bold Italic.ttf",
 )
 FONT_MONO = (
     os.environ.get("RECEIPT_FONT_MONO"),
@@ -141,6 +162,240 @@ def _to_bw_text(img_l: Image.Image) -> Image.Image:
 def _to_bw_fs(img_l: Image.Image) -> Image.Image:
     """Floyd-Steinberg — for gradients and patterned fills."""
     return img_l.convert("1", dither=Image.Dither.FLOYDSTEINBERG)
+
+
+# ---------- inline markdown ----------
+#
+# Lightweight CommonMark-ish parser that recognises:
+#   ***bi***  ___bi___    bold + italic
+#   **b**     __b__       bold
+#   *i*       _i_         italic   (`_` requires word-boundary so
+#                                    snake_case stays plain text)
+#   `code`                inline mono
+#   ~~s~~                 strike-through
+#
+# Output: list of (text, style_set) runs. Styles are a frozenset of
+# {"b","i","code","s"}.  Used by every text-emitting block so that
+# "**done**" prints as bold "done", not literal asterisks.
+
+_StyleSet = FrozenSet[str]
+_Run = Tuple[str, _StyleSet]
+
+# Patterns ordered longest-delim-first; the recursive splitter picks
+# the earliest match across all of them.  Each pattern requires the
+# inner content to start and end with a non-space char so stray "*"
+# in arithmetic ("5 * 4 * 3") doesn't accidentally italicise.
+_INLINE_PATTERNS: Tuple[Tuple[re.Pattern[str], _StyleSet], ...] = (
+    (re.compile(r"\*\*\*(?=\S)([\s\S]+?)(?<=\S)\*\*\*"), frozenset({"b", "i"})),
+    (re.compile(r"___(?=\S)([\s\S]+?)(?<=\S)___"),       frozenset({"b", "i"})),
+    (re.compile(r"\*\*(?=\S)([\s\S]+?)(?<=\S)\*\*"),     frozenset({"b"})),
+    (re.compile(r"(?<![A-Za-z0-9])__(?=\S)([^\n]+?)(?<=\S)__(?![A-Za-z0-9])"),
+     frozenset({"b"})),
+    (re.compile(r"(?<![A-Za-z0-9])_(?=\S)([^\n_]+?)(?<=\S)_(?![A-Za-z0-9])"),
+     frozenset({"i"})),
+    (re.compile(r"\*(?=\S)([^\n*]+?)(?<=\S)\*"),         frozenset({"i"})),
+    (re.compile(r"`([^`\n]+)`"),                          frozenset({"code"})),
+    (re.compile(r"~~(?=\S)([\s\S]+?)(?<=\S)~~"),         frozenset({"s"})),
+)
+
+
+def _parse_inline(text: str) -> List[_Run]:
+    """Split ``text`` into a flat list of (substring, styles) runs."""
+    if not text:
+        return []
+
+    def split(s: str, current: _StyleSet) -> List[_Run]:
+        earliest: Optional[Tuple[re.Match[str], _StyleSet]] = None
+        for pattern, styles in _INLINE_PATTERNS:
+            m = pattern.search(s)
+            if m and (earliest is None or m.start() < earliest[0].start()):
+                earliest = (m, styles)
+        if earliest is None:
+            return [(s, current)] if s else []
+        m, styles = earliest
+        out: List[_Run] = []
+        if m.start() > 0:
+            out.append((s[: m.start()], current))
+        # Inside a code span we don't recurse — backticks lock content
+        # to its literal form so `**foo**` inside code stays as text.
+        if "code" in styles:
+            out.append((m.group(1), current | styles))
+        else:
+            out.extend(split(m.group(1), current | styles))
+        if m.end() < len(s):
+            out.extend(split(s[m.end():], current))
+        return out
+
+    runs = split(text, frozenset())
+    # Coalesce neighbours that share a style — keeps draw calls tidy.
+    merged: List[_Run] = []
+    for run in runs:
+        if merged and merged[-1][1] == run[1]:
+            merged[-1] = (merged[-1][0] + run[0], run[1])
+        else:
+            merged.append(run)
+    return merged
+
+
+# ---------- styled-line layout ----------
+
+# (kind, text, styles); kind ∈ {"word","space","newline"}.
+_Token = Tuple[str, str, _StyleSet]
+
+
+def _tokenize_runs(runs: Iterable[_Run]) -> List[_Token]:
+    out: List[_Token] = []
+    for text, styles in runs:
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "\n":
+                out.append(("newline", "\n", styles))
+                i += 1
+                continue
+            if ch.isspace():
+                j = i
+                while j < len(text) and text[j].isspace() and text[j] != "\n":
+                    j += 1
+                out.append(("space", text[i:j], styles))
+                i = j
+                continue
+            j = i
+            while j < len(text) and not text[j].isspace():
+                j += 1
+            out.append(("word", text[i:j], styles))
+            i = j
+    return out
+
+
+_FontFor = Any  # callable: styles -> ImageFont
+
+
+def _font_for_inline(base_regular: Sequence[Optional[str]],
+                     base_bold: Sequence[Optional[str]],
+                     size: int) -> _FontFor:
+    """Return a function mapping a style-set to a loaded font."""
+
+    def lookup(styles: _StyleSet) -> ImageFont.ImageFont:
+        if "code" in styles:
+            return _font(FONT_MONO, size)
+        if "b" in styles and "i" in styles:
+            # Fall back to plain bold if a bold-italic face is missing.
+            try:
+                return _font(FONT_BOLD_ITALIC, size)
+            except Exception:  # noqa: BLE001
+                return _font(base_bold, size)
+        if "b" in styles:
+            return _font(base_bold, size)
+        if "i" in styles:
+            try:
+                return _font(FONT_ITALIC, size)
+            except Exception:  # noqa: BLE001
+                return _font(base_regular, size)
+        return _font(base_regular, size)
+
+    return lookup
+
+
+def _wrap_styled(draw: ImageDraw.ImageDraw,
+                 tokens: Sequence[_Token],
+                 font_for: _FontFor,
+                 max_width: int) -> List[List[_Run]]:
+    """Greedy line-wrap a stream of styled tokens.
+
+    Returns a list of lines; each line is a list of (text, styles)
+    runs ready for ``_draw_styled_line`` to paint.
+    """
+    lines: List[List[_Run]] = [[]]
+    cur_w = 0
+    pending_space: Optional[Tuple[str, _StyleSet, int]] = None
+
+    def push_run(text: str, styles: _StyleSet) -> None:
+        line = lines[-1]
+        if line and line[-1][1] == styles:
+            line[-1] = (line[-1][0] + text, styles)
+        else:
+            line.append((text, styles))
+
+    for kind, text, styles in tokens:
+        if kind == "newline":
+            lines.append([])
+            cur_w = 0
+            pending_space = None
+            continue
+        if kind == "space":
+            if cur_w > 0:
+                pending_space = (text, styles,
+                                 _measure(draw, text, font_for(styles))[0])
+            continue
+        # word
+        font = font_for(styles)
+        ww = _measure(draw, text, font)[0]
+        sp_w = pending_space[2] if pending_space else 0
+        if cur_w > 0 and cur_w + sp_w + ww > max_width:
+            lines.append([])
+            cur_w = 0
+            pending_space = None
+        elif pending_space is not None:
+            sp_text, sp_styles, _sp_w = pending_space
+            push_run(sp_text, sp_styles)
+            cur_w += sp_w
+            pending_space = None
+        if ww <= max_width:
+            push_run(text, styles)
+            cur_w += ww
+            continue
+        # Single word longer than the line — break by character.
+        cur_chars = ""
+        for ch in text:
+            test = cur_chars + ch
+            tw = _measure(draw, test, font)[0]
+            if tw > max_width and cur_chars:
+                push_run(cur_chars, styles)
+                lines.append([])
+                cur_chars = ch
+                cur_w = 0
+            else:
+                cur_chars = test
+        if cur_chars:
+            push_run(cur_chars, styles)
+            cur_w = _measure(draw, cur_chars, font)[0]
+    # Strip trailing empty line if the source ended with "\n".
+    if len(lines) > 1 and not lines[-1]:
+        lines.pop()
+    return lines
+
+
+def _line_metrics(draw: ImageDraw.ImageDraw,
+                  font_for: _FontFor,
+                  size_hint: int) -> int:
+    """Pick a uniform line height so mixed-weight runs sit on the
+    same baseline."""
+    sample = font_for(frozenset({"b"}))
+    return int(_measure(draw, "Mg", sample)[1] * 1.30) if sample else size_hint
+
+
+def _line_width(draw: ImageDraw.ImageDraw,
+                line: Sequence[_Run],
+                font_for: _FontFor) -> int:
+    return sum(_measure(draw, t, font_for(s))[0] for t, s in line)
+
+
+def _draw_styled_line(draw: ImageDraw.ImageDraw,
+                      x: int, y: int,
+                      line: Sequence[_Run],
+                      font_for: _FontFor) -> int:
+    """Paint a wrapped line of styled runs. Returns total width drawn."""
+    cursor = x
+    for text, styles in line:
+        font = font_for(styles)
+        draw.text((cursor, y), text, font=font, fill=0)
+        w, h = _measure(draw, text, font)
+        if "s" in styles and w > 0:
+            mid = y + h // 2
+            draw.line((cursor, mid, cursor + w - 1, mid), fill=0, width=1)
+        cursor += w
+    return cursor - x
 
 
 def _format_num(v: Any) -> str:
@@ -670,18 +925,21 @@ def _block_header(b: Dict[str, Any]) -> Image.Image:
 
 def _block_title(b: Dict[str, Any]) -> Image.Image:
     content = str(b.get("content", ""))
-    f = _font(FONT_BOLD, FS_TITLE)
-    img_tmp = Image.new("L", (CONTENT_W, 1), 255)
-    draw_tmp = ImageDraw.Draw(img_tmp)
-    lines = _wrap(draw_tmp, content, f, CONTENT_W)
-    line_h = int(_measure(draw_tmp, "Mg", f)[1] * 1.30)
+    # Title is already bold; inline ** inside flips to bold-italic so
+    # emphasis still reads on the heaviest line of the ticket.
+    font_for = _font_for_inline(FONT_BOLD, FONT_BOLD, FS_TITLE)
+    runs = _parse_inline(content)
+    tmp = ImageDraw.Draw(Image.new("L", (1, 1), 255))
+    tokens = _tokenize_runs(runs)
+    lines = _wrap_styled(tmp, tokens, font_for, CONTENT_W)
+    line_h = _line_metrics(tmp, font_for, FS_TITLE)
     height = max(line_h, line_h * len(lines))
 
     img = Image.new("L", (CONTENT_W, height), 255)
     draw = ImageDraw.Draw(img)
     y = 0
     for line in lines:
-        draw.text((0, y), line, font=f, fill=0)
+        _draw_styled_line(draw, 0, y, line, font_for)
         y += line_h
     return _to_bw_text(img)
 
@@ -710,12 +968,16 @@ def _block_text(b: Dict[str, Any]) -> Image.Image:
     style = str(b.get("style", "body"))
     align = b.get("align") or _STYLE_ALIGN.get(style, "left")
     font_path, fs, lh_mul = _STYLE_FONTS.get(style, _STYLE_FONTS["body"])
-    f = _font(font_path, fs)
+    base_bold = FONT_BOLD if font_path is FONT_REGULAR else font_path
+    font_for = _font_for_inline(font_path, base_bold, fs)
+    sample = font_for(frozenset())
+    line_h = int(_measure(ImageDraw.Draw(Image.new("L", (1, 1), 255)),
+                          "Mg", sample)[1] * lh_mul)
 
-    img_tmp = Image.new("L", (CONTENT_W, 1), 255)
-    draw_tmp = ImageDraw.Draw(img_tmp)
-    lines = _wrap(draw_tmp, content, f, CONTENT_W)
-    line_h = int(_measure(draw_tmp, "Mg", f)[1] * lh_mul)
+    runs = _parse_inline(content)
+    tmp = ImageDraw.Draw(Image.new("L", (1, 1), 255))
+    tokens = _tokenize_runs(runs)
+    lines = _wrap_styled(tmp, tokens, font_for, CONTENT_W)
     height = max(line_h, line_h * len(lines))
 
     img = Image.new("L", (CONTENT_W, height), 255)
@@ -723,14 +985,12 @@ def _block_text(b: Dict[str, Any]) -> Image.Image:
     y = 0
     for line in lines:
         if align == "center":
-            w, _ = _measure(draw, line, f)
-            x = (CONTENT_W - w) // 2
+            x = (CONTENT_W - _line_width(draw, line, font_for)) // 2
         elif align == "right":
-            w, _ = _measure(draw, line, f)
-            x = CONTENT_W - w
+            x = CONTENT_W - _line_width(draw, line, font_for)
         else:
             x = 0
-        draw.text((x, y), line, font=f, fill=0)
+        _draw_styled_line(draw, x, y, line, font_for)
         y += line_h
     return _to_bw_text(img)
 
@@ -739,31 +999,33 @@ def _block_bullets(b: Dict[str, Any]) -> Image.Image:
     items = list(b.get("items") or [])
     if not items:
         return Image.new("1", (CONTENT_W, 1), 1)
-    f = _font(FONT_REGULAR, FS_BODY)
+    font_for = _font_for_inline(FONT_REGULAR, FONT_BOLD, FS_BODY)
+    f_plain = _font(FONT_REGULAR, FS_BODY)
     bullet_x = 4
     text_x = 24
     text_w = CONTENT_W - text_x
 
-    img_tmp = Image.new("L", (1, 1), 255)
-    draw_tmp = ImageDraw.Draw(img_tmp)
-    line_h = int(_measure(draw_tmp, "Mg", f)[1] * 1.40)
+    tmp = ImageDraw.Draw(Image.new("L", (1, 1), 255))
+    line_h = int(_measure(tmp, "Mg", f_plain)[1] * 1.40)
 
+    wrapped_all: List[List[List[_Run]]] = []
     height = 0
-    wrapped_all: List[List[str]] = []
-    for r in items:
-        w_lines = _wrap(draw_tmp, str(r), f, text_w)
-        wrapped_all.append(w_lines)
-        height += line_h * max(1, len(w_lines)) + 4
+    for raw in items:
+        runs = _parse_inline(str(raw))
+        tokens = _tokenize_runs(runs)
+        lines = _wrap_styled(tmp, tokens, font_for, text_w)
+        wrapped_all.append(lines)
+        height += line_h * max(1, len(lines)) + 4
     height = max(height, line_h)
 
     img = Image.new("L", (CONTENT_W, height), 255)
     draw = ImageDraw.Draw(img)
     y = 0
-    for w_lines in wrapped_all:
-        for i, line in enumerate(w_lines):
+    for lines in wrapped_all:
+        for i, line in enumerate(lines):
             if i == 0:
-                draw.text((bullet_x, y), "•", font=f, fill=0)
-            draw.text((text_x, y), line, font=f, fill=0)
+                draw.text((bullet_x, y), "•", font=f_plain, fill=0)
+            _draw_styled_line(draw, text_x, y, line, font_for)
             y += line_h
         y += 4
     return _to_bw_text(img)

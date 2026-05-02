@@ -91,6 +91,44 @@ class RendererTests(unittest.TestCase):
 
         self.assertGreater(long.height, short.height)
 
+    def test_inline_parser_handles_common_markdown(self) -> None:
+        runs = renderer._parse_inline(
+            "mix **bold** and *italic* and `code` and ~~strike~~ and ***both***"
+        )
+        styles = {text: set(s) for text, s in runs}
+        self.assertEqual(styles["bold"], {"b"})
+        self.assertEqual(styles["italic"], {"i"})
+        self.assertEqual(styles["code"], {"code"})
+        self.assertEqual(styles["strike"], {"s"})
+        self.assertEqual(styles["both"], {"b", "i"})
+
+    def test_inline_parser_skips_intra_word_underscores(self) -> None:
+        # snake_case identifiers and arithmetic should stay unstyled.
+        for text in ("snake_case_var", "5 * 4 * 3 = 60"):
+            runs = renderer._parse_inline(text)
+            self.assertEqual(runs, [(text, frozenset())], text)
+
+    def test_inline_parser_locks_code_span_content(self) -> None:
+        runs = renderer._parse_inline("`literal **stars**`")
+        self.assertEqual(runs, [("literal **stars**", frozenset({"code"}))])
+
+    def test_render_blocks_strips_markdown_delimiters(self) -> None:
+        # Plain ASCII rendering of styled content must not contain the
+        # raw "**" / "*" delimiters that the parser is meant to consume.
+        plain = renderer.render_blocks([
+            {"type": "title", "content": "Refined formatting"},
+            {"type": "bullets", "items": ["Added bold rendering"]},
+        ])
+        styled = renderer.render_blocks([
+            {"type": "title", "content": "Refined **formatting**"},
+            {"type": "bullets", "items": ["Added **bold** rendering"]},
+        ])
+        # Visually different (bold weight changes pixel count)…
+        self.assertNotEqual(plain.tobytes(), styled.tobytes())
+        # …but neither image should contain runaway height from the
+        # delimiters being treated as literal text.
+        self.assertLess(abs(plain.height - styled.height), 8)
+
     def test_render_qr_code_returns_printable_image(self) -> None:
         img = renderer.render_qr_code(
             "https://github.com/denya/receipt-printer",
