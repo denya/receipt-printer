@@ -5,9 +5,13 @@
 # - Reads the Claude SessionEnd event JSON from stdin.
 # - Parses the transcript file to extract the first user message,
 #   last assistant turns, model, turn count, and duration.
-# - Asks Claude Haiku (claude-haiku-4-5-20251001) whether this session
-#   is a "FINAL VALUABLE" task worth a paper receipt — trivial, aborted,
-#   or chat-only sessions are filtered out.
+# - Filters out sessions that ended mid-conversation (assistant asking
+#   a question, presenting a plan, awaiting confirmation) via a local
+#   heuristic on the last assistant turn — these never produce a receipt
+#   regardless of how much work happened earlier.
+# - For sessions that pass the local filter, asks Claude Haiku
+#   (claude-haiku-4-5-20251001) whether the session reached a real
+#   completion vs trivial / aborted / exploratory work.
 # - On "PRINT", POSTs the ticket to the home receipt printer.
 # - All failures are silent: a missing/unreachable printer or API must
 #   never block Claude Code.
@@ -30,11 +34,12 @@ event="$(cat || true)"
 transcript_path="$(printf '%s' "$event" | jq -r '.transcript_path // empty' 2>/dev/null || true)"
 session_id="$(printf '%s' "$event" | jq -r '.session_id // empty' 2>/dev/null || true)"
 cwd="$(printf '%s' "$event" | jq -r '.cwd // empty' 2>/dev/null || true)"
+end_reason="$(printf '%s' "$event" | jq -r '.reason // empty' 2>/dev/null || true)"
 
-python3 - "$transcript_path" "$session_id" "$cwd" "$PRINTER_URL" "$FILTER_MODEL" <<'PY' >/dev/null 2>&1 || true
+python3 - "$transcript_path" "$session_id" "$cwd" "$PRINTER_URL" "$FILTER_MODEL" "$end_reason" <<'PY' >/dev/null 2>&1 || true
 import json, os, sys, urllib.request, datetime, re
 
-transcript, session_id, cwd, url, filter_model = sys.argv[1:6]
+transcript, session_id, cwd, url, filter_model, end_reason = sys.argv[1:7]
 
 title = "Claude session"
 results = []
@@ -103,9 +108,47 @@ if first_ts and last_ts:
     except Exception:
         pass
 
+# ---- Mid-conversation detection ---------------------------------------
+# Sessions that END in the middle of a conversation (assistant asking a
+# question, presenting a plan for approval, requesting clarification) are
+# NOT completed tasks and should not produce a receipt.
+MID_CONVERSATION_PATTERNS = (
+    "should i ", "shall i ", "shall we ", "want me to", "would you like",
+    "do you want", "let me know if", "let me know whether", "let me know which",
+    "confirm whether", "please confirm", "before i proceed", "before i continue",
+    "before i do ", "before making", "here's the plan", "here is the plan",
+    "here's my plan", "here is my plan", "here's what i propose",
+    "here is what i propose", "which would you prefer", "which do you prefer",
+    "ready to proceed", "ok to proceed", "okay to proceed", "shall we proceed",
+    "i'll wait for", "awaiting your", "your call", "need me to",
+    "should i go ahead", "want me to go ahead", "want me to proceed",
+    "if you'd like me to", "if you want me to", "do you want me to",
+    "would you rather", "any preference",
+)
+
+def looks_like_mid_conversation(text: str) -> bool:
+    """Heuristic: does the LAST assistant message indicate the session
+    ended mid-task — asking the user a question, presenting a plan, or
+    awaiting confirmation? If so, no receipt regardless of earlier work.
+    """
+    if not text:
+        return False
+    t = text.strip()
+    # Any assistant message that ends with a question mark is asking the
+    # user something — not a completion. (False positives on rhetorical
+    # closing questions are rare and acceptable.)
+    if t.endswith("?"):
+        return True
+    # Check the trailing chunk for explicit asking phrases.
+    tail = t[-400:].lower()
+    for pat in MID_CONVERSATION_PATTERNS:
+        if pat in tail:
+            return True
+    return False
+
 # ---- Haiku filter: should we print this receipt? ----------------------
 def should_print() -> bool:
-    """Ask Haiku whether this session is final & valuable enough to print.
+    """Decide whether this session is a completed task worth printing.
 
     Returns True if printing should proceed. Defaults to True on any
     error, missing API key, or PRINT_FILTER=off — so missing config never
@@ -115,34 +158,61 @@ def should_print() -> bool:
     if mode in ("off", "force"):
         return True
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        return True  # legacy: print everything when no key configured
-
     # Cheap local pre-filter — skip obvious noise without burning API cost.
     if turns < 2:
         return False
     if not first_user_text and not last_assistant_texts:
         return False
 
+    # Hard skip: last assistant turn is clearly a question or plan-for-
+    # approval. This means the session ended mid-conversation, which is
+    # never a completion regardless of how much work happened earlier.
+    last_assistant = last_assistant_texts[-1] if last_assistant_texts else ""
+    if looks_like_mid_conversation(last_assistant):
+        return False
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return True  # legacy: print everything when no key configured
+
     sample = {
         "first_user_message": (first_user_text or "")[:600],
-        "last_assistant_turns": [t[:400] for t in last_assistant_texts[-3:]],
+        "last_assistant_turn": last_assistant[:1200],
+        "previous_assistant_turns": [t[:300] for t in last_assistant_texts[-4:-1]],
         "turns": turns,
         "duration": duration,
         "cwd": cwd,
+        "session_end_reason": end_reason or None,
     }
 
     system = (
-        "You are a strict filter that decides whether a Claude Code session "
-        "deserves a paper receipt printed at home. Print ONLY when the session "
-        "represents a FINAL VALUABLE outcome: real code shipped, a bug "
-        "diagnosed and fixed, a meaningful artifact produced, a non-trivial "
-        "investigation completed, or a clear deliverable handed back to the user. "
-        "DO NOT print: trivial Q&A, aborted/half-done work, exploratory chat, "
-        "single-step lookups, configuration tweaks, debugging dead-ends without "
-        "resolution, or sessions where the assistant mostly asked clarifying "
-        "questions. Reply with EXACTLY one token: PRINT or SKIP. No explanation."
+        "You decide whether a Claude Code session deserves a paper receipt "
+        "printed at home. Sessions end for many reasons: real completion, but "
+        "also user quitting mid-task, asking the assistant a question and "
+        "leaving, or pausing to think. Your job: distinguish a FINISHED task "
+        "from one that ended MID-CONVERSATION.\n\n"
+        "Reply PRINT only when the LAST assistant turn shows the assistant "
+        "delivered a concrete completed outcome and is NOT awaiting user "
+        "input on next steps. Strong PRINT signals in the last turn:\n"
+        "- Code committed/pushed with hash, PR/branch/file paths\n"
+        "- Bug fix verified (tests pass, behavior confirmed)\n"
+        "- Deployment completed (service healthy, container running)\n"
+        "- File created/modified with summary of what changed\n"
+        "- Investigation/analysis with concrete conclusions delivered\n"
+        "- Final wrap-up summary of what was accomplished this session\n\n"
+        "Reply SKIP when the LAST assistant turn shows the session ended "
+        "mid-conversation. Strong SKIP signals in the last turn:\n"
+        "- Asks the user a question (ends with '?', 'Should I…', 'Want me to…')\n"
+        "- Presents a plan and waits for approval ('Here's the plan:', 'Ready?')\n"
+        "- Requests clarification ('What did you mean…', 'Could you confirm…')\n"
+        "- Offers options for the user to choose between\n"
+        "- Aborted/partial work, dead-end debugging without a fix\n"
+        "- Trivial Q&A or single-step lookup\n"
+        "- Pure exploration with no concrete deliverable\n\n"
+        "PRIORITY RULE: if the LAST assistant turn is asking, planning, "
+        "or awaiting input — reply SKIP, even if earlier turns shipped real "
+        "work. The session is not over for the user yet.\n\n"
+        "Reply with EXACTLY one token: PRINT or SKIP."
     )
 
     user = (
