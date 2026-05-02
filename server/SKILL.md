@@ -14,12 +14,12 @@ what the rendering pipeline can do, and how to compose a good ticket.
 
 | Property | Value |
 |---|---|
-| Host | `100.78.6.79` (Tailscale) — also reachable on the home LAN at the Pi's `10.42.x.x` IP |
+| Host | your printer host |
 | Port | `9100` |
-| Base URL | `http://100.78.6.79:9100` |
+| Base URL | `http://your-printer-host:9100` |
 | Hardware | Epson TM-T20II, 80 mm thermal, ESC/POS, 203 DPI |
 | Print width | 576 dots (= 72 mm) |
-| Source on the Pi | `/home/denya/receipt-printer-service/` |
+| Source on host | standalone deployment directory of your choice |
 | Container | `receipt-printer` (Docker Compose, restart `unless-stopped`) |
 
 `GET /health` returns `{"ok": true, ...}` when the printer device is

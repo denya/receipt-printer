@@ -45,7 +45,7 @@ Examples:
 If you already have a server with a printer attached somewhere, this is the simplest path.
 
 ```bash
-export PRINTER_URL="http://100.78.6.79:9100"
+export PRINTER_URL="http://your-printer-host:9100"
 curl "$PRINTER_URL/health"
 curl -X POST "$PRINTER_URL/print/session" \
   -H 'Content-Type: application/json' \
@@ -146,7 +146,7 @@ The Claude hook uses `SessionEnd`. The Codex hook uses the global `notify` surfa
 Session ticket:
 
 ```bash
-curl -X POST http://100.78.6.79:9100/print/session \
+curl -X POST http://your-printer-host:9100/print/session \
   -H 'Content-Type: application/json' \
   -d '{"brand":"CODEX","title":"Repo shipped","results":["Hook installed","Pi updated"]}'
 ```
@@ -154,7 +154,7 @@ curl -X POST http://100.78.6.79:9100/print/session \
 Rich ticket with QR:
 
 ```bash
-curl -X POST http://100.78.6.79:9100/print/rich \
+curl -X POST http://your-printer-host:9100/print/rich \
   -H 'Content-Type: application/json' \
   -d '{"blocks":[
     {"type":"header","title":"README","subtitle":"SCAN ME"},
