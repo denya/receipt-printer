@@ -54,6 +54,7 @@ STATUS_URL="${STATUS_URL:-${PRINTER_URL%/print/session}/status/update}"
 FILTER_MODEL="claude-haiku-4-5-20251001"
 STATE_PATH="${HOME}/.claude/hooks/print-stop-state.json"
 STATUS_TOKEN_FILE="${STATUS_TOKEN_FILE:-$HOME/.config/receipt-printer/status-api-token}"
+STATUS_LOG_PATH="${STATUS_LOG_PATH:-$HOME/.claude/hooks/print-status.log}"
 
 # Find claude CLI — Claude Code may launch hooks with a minimal PATH.
 if [ -z "${CLAUDE_BIN:-}" ]; then
@@ -75,7 +76,7 @@ session_id="$(printf '%s' "$event" | jq -r '.session_id // empty' 2>/dev/null ||
 cwd="$(printf '%s' "$event" | jq -r '.cwd // empty' 2>/dev/null || true)"
 stop_hook_active="$(printf '%s' "$event" | jq -r '.stop_hook_active // empty' 2>/dev/null || true)"
 
-python3 - "$transcript_path" "$session_id" "$cwd" "$PRINTER_URL" "$STATUS_URL" "$FILTER_MODEL" "$STATE_PATH" "$stop_hook_active" "${CLAUDE_BIN:-}" "$STATUS_TOKEN_FILE" <<'PY' >/dev/null 2>&1 || true
+python3 - "$transcript_path" "$session_id" "$cwd" "$PRINTER_URL" "$STATUS_URL" "$FILTER_MODEL" "$STATE_PATH" "$stop_hook_active" "${CLAUDE_BIN:-}" "$STATUS_TOKEN_FILE" "$STATUS_LOG_PATH" <<'PY' >/dev/null 2>&1 || true
 import datetime
 import hashlib
 import json
@@ -96,7 +97,8 @@ import urllib.request
     stop_hook_active,
     claude_bin,
     status_token_file,
-) = sys.argv[1:10]
+    status_log_path,
+) = sys.argv[1:12]
 
 title = "Claude session"
 results = []
@@ -256,6 +258,16 @@ def load_status_token() -> str:
         return ""
 
 
+def debug_log(message: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(os.path.expanduser(status_log_path)), exist_ok=True)
+        with open(os.path.expanduser(status_log_path), "a", encoding="utf-8") as f:
+            ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            f.write(f"{ts} {message}\n")
+    except Exception:
+        pass
+
+
 def post_status_update() -> None:
     status = classify_status(last_assistant)
     body = {
@@ -353,14 +365,15 @@ current_hash = msg_hash(last_assistant)
 state = load_state()
 session_key = session_id or "_unknown"
 sess_state = state.get("sessions", {}).get(session_key, {})
-if sess_state.get("last_printed_hash") == current_hash:
-    # Already printed THIS exact turn — nothing new.
-    sys.exit(0)
 
 try:
     post_status_update()
-except Exception:
-    pass
+except Exception as exc:
+    debug_log(f"status_update_failed session={session_key} error={exc!r}")
+
+if sess_state.get("last_printed_hash") == current_hash:
+    # Already printed THIS exact turn — nothing new for the print path.
+    sys.exit(0)
 
 # ---- Haiku decision (the reliable verdict) ----------------------------
 def haiku_says_print() -> bool:

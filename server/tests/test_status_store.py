@@ -1,6 +1,7 @@
 import pathlib
 import tempfile
 import unittest
+import datetime as dt
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -8,7 +9,7 @@ import sys
 sys.path.insert(0, str(ROOT))
 
 from schemas import SessionStatusUpdate
-from status_store import StatusStore
+from status_store import StatusStore, utc_now_iso
 
 
 class StatusStoreTests(unittest.TestCase):
@@ -62,3 +63,67 @@ class StatusStoreTests(unittest.TestCase):
             self.assertFalse(payload["stale"])
             self.assertIn("active session", payload["speech_text"])
             self.assertIn("Telegram triage", payload["speech_text"])
+
+    def test_voice_payload_filters_internal_prompt_titles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = StatusStore(
+                db_path=str(pathlib.Path(tmpdir) / "status.db"),
+                active_window_seconds=1800,
+                recent_window_seconds=86400,
+            )
+            store.ingest(SessionStatusUpdate(
+                source="codex",
+                session_key="bad-1",
+                turn_key="bad-1:1",
+                title="You are a helpful assistant. You will be presented with a user prompt.",
+                summary_line='{"title":"Review b6e364d"}',
+                status="unknown",
+            ))
+            store.ingest(SessionStatusUpdate(
+                source="codex",
+                session_key="good-1",
+                turn_key="good-1:1",
+                title="Alexa skill setup",
+                summary_line="Skill created and ready for testing.",
+                status="completed",
+            ))
+
+            payload = store.voice_payload(limit=3)
+
+            self.assertIn("Alexa skill setup", payload["speech_text"])
+            self.assertNotIn("You are a helpful assistant", payload["speech_text"])
+
+    def test_recent_payload_reads_multiple_recent_sessions_when_no_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = StatusStore(
+                db_path=str(pathlib.Path(tmpdir) / "status.db"),
+                active_window_seconds=1,
+                recent_window_seconds=86400,
+            )
+            base = dt.datetime.fromisoformat(utc_now_iso().replace("Z", "+00:00"))
+            store.ingest(SessionStatusUpdate(
+                source="codex",
+                session_key="recent-1",
+                turn_key="recent-1:1",
+                title="First recent session",
+                summary_line="First recent summary.",
+                status="completed",
+                updated_at=(base - dt.timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
+            ))
+            store.ingest(SessionStatusUpdate(
+                source="codex",
+                session_key="recent-2",
+                turn_key="recent-2:1",
+                title="Second recent session",
+                summary_line="Second recent summary.",
+                status="completed",
+                updated_at=(base - dt.timedelta(minutes=4)).isoformat().replace("+00:00", "Z"),
+            ))
+
+            payload = store.voice_payload(limit=3)
+
+            self.assertTrue(payload["stale"])
+            self.assertIn("Latest recent sessions", payload["speech_text"])
+            self.assertNotIn("No active sessions right now", payload["speech_text"])
+            self.assertIn("Second recent session", payload["speech_text"])
+            self.assertIn("First recent session", payload["speech_text"])

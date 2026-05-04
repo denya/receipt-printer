@@ -31,6 +31,7 @@ OMX_NOTIFY_CMD = [
     "/opt/homebrew/lib/node_modules/oh-my-codex/dist/scripts/notify-hook.js",
 ]
 STATE_PATH = Path.home() / ".codex" / "hooks" / "print-codex-state.json"
+STATUS_LOG_PATH = Path.home() / ".codex" / "hooks" / "print-codex-status.log"
 STATUS_TOKEN_FILE = Path(
     os.environ.get(
         "STATUS_TOKEN_FILE", str(Path.home() / ".config" / "receipt-printer" / "status-api-token")
@@ -85,11 +86,40 @@ def clean_text(text: str) -> str:
     return text
 
 
+def looks_like_internal_prompt(text: str) -> bool:
+    lowered = clean_text(text).lower()
+    internal_markers = (
+        "you are a helpful assistant.",
+        "you will be presented with a user prompt",
+        "your job is to provide a short title",
+        "read-only final verification",
+        "return either:",
+        "review commit ",
+        "focus only on these files:",
+    )
+    return any(marker in lowered for marker in internal_markers)
+
+
+def json_title(text: str) -> str:
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return ""
+    if isinstance(parsed, dict):
+        title = safe_string(parsed.get("title")).strip()
+        if title:
+            return clean_text(title)[:120]
+    return ""
+
+
 def derive_title(payload: dict[str, Any]) -> str:
     for item in normalize_input_messages(payload):
         cleaned = clean_text(item)
-        if cleaned and not cleaned.startswith("/"):
+        if cleaned and not cleaned.startswith("/") and not looks_like_internal_prompt(cleaned):
             return cleaned[:120]
+    assistant_title = json_title(assistant_message(payload))
+    if assistant_title:
+        return assistant_title
     cwd = safe_string(payload.get("cwd"))
     if cwd:
         return f"Codex · {Path(cwd).name or cwd}"
@@ -197,6 +227,9 @@ def classify_status(text: str) -> str:
 
 
 def derive_summary_line(text: str, status: str) -> str:
+    embedded_title = json_title(text)
+    if embedded_title:
+        return embedded_title
     sentences = split_sentences(text)
     if status == "waiting":
         return "Waiting for your input."
@@ -230,7 +263,7 @@ def save_state(state: dict[str, Any]) -> None:
         pass
 
 
-def seen_turn(payload: dict[str, Any]) -> bool:
+def seen_print_turn(payload: dict[str, Any]) -> bool:
     thread_id = safe_string(payload.get("thread-id") or payload.get("thread_id"))
     turn_id = safe_string(payload.get("turn-id") or payload.get("turn_id"))
     if not thread_id or not turn_id:
@@ -250,6 +283,16 @@ def seen_turn(payload: dict[str, Any]) -> bool:
     state["recent_turn_keys"] = recent
     save_state(state)
     return False
+
+
+def debug_log(message: str) -> None:
+    try:
+        STATUS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        STATUS_LOG_PATH.write_text(
+            (STATUS_LOG_PATH.read_text() if STATUS_LOG_PATH.exists() else "") + message + "\n"
+        )
+    except Exception:
+        pass
 
 
 def looks_like_interim_update(text: str) -> bool:
@@ -422,17 +465,17 @@ def main() -> int:
     try:
         if not payload:
             return 0
-        if seen_turn(payload):
-            return 0
 
         text = assistant_message(payload)
         if not text:
             return 0
         try:
             post_status_update(payload, text)
-        except Exception:
-            pass
+        except Exception as exc:
+            debug_log(f"status_update_failed thread={safe_string(payload.get('thread-id') or payload.get('thread_id'))} error={exc!r}")
         if should_print(payload, text):
+            if seen_print_turn(payload):
+                return 0
             try:
                 post_receipt(payload, text)
             except Exception:

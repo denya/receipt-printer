@@ -145,13 +145,16 @@ def create_app(
     async def alexa(request: Request):
         body = (await request.body()).decode("utf-8")
         headers = {key: value for key, value in request.headers.items()}
+        ua = headers.get("user-agent", "")
+        cf_ray = headers.get("cf-ray", "")
+        log.warning("alexa request received: ua=%r cf-ray=%r body_bytes=%d",
+                    ua, cf_ray, len(body))
         try:
             response_body = alexa_handler.verify_request_and_dispatch(headers, body)
         except Exception as exc:
             log.warning(
-                "alexa request rejected: %s; header_keys=%s",
-                exc,
-                sorted(headers.keys()),
+                "alexa request rejected: %s; ua=%r cf-ray=%r header_keys=%s",
+                exc, ua, cf_ray, sorted(headers.keys()),
             )
             raise HTTPException(status_code=400, detail="invalid_alexa_request")
         if isinstance(response_body, (dict, list)):

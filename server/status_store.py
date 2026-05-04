@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import sqlite3
 import threading
 from pathlib import Path
@@ -38,6 +39,18 @@ class StatusStore:
         self.recent_window_seconds = max(self.active_window_seconds, int(recent_window_seconds))
         self._lock = threading.Lock()
         self._init_db()
+
+    def _select_recent_rows(self, conn: sqlite3.Connection, cutoff: str, limit: int) -> List[sqlite3.Row]:
+        return conn.execute(
+            """
+            SELECT *
+            FROM session_latest
+            WHERE updated_at >= ?
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (cutoff, limit),
+        ).fetchall()
 
     def ingest(self, update: SessionStatusUpdate) -> Dict[str, Any]:
         updated_at = normalize_timestamp(update.updated_at)
@@ -152,34 +165,19 @@ class StatusStore:
         with self._lock:
             conn = self._connect()
             try:
-                active_rows = conn.execute(
-                    """
-                    SELECT *
-                    FROM session_latest
-                    WHERE updated_at >= ?
-                    ORDER BY updated_at DESC
-                    """,
-                    (active_cutoff,),
-                ).fetchall()
-                recent_rows = conn.execute(
-                    """
-                    SELECT *
-                    FROM session_latest
-                    WHERE updated_at >= ?
-                    ORDER BY updated_at DESC
-                    LIMIT ?
-                    """,
-                    (recent_cutoff, effective_limit),
-                ).fetchall()
+                active_rows = self._select_recent_rows(conn, active_cutoff, 20)
+                recent_rows = self._select_recent_rows(conn, recent_cutoff, 20)
             finally:
                 conn.close()
 
-        if active_rows:
-            visible_rows = active_rows[:effective_limit]
-            speech = self._active_speech(visible_rows, len(active_rows))
+        active_voice_rows = [row for row in active_rows if self._is_voiceworthy_row(row)]
+        recent_voice_rows = [row for row in recent_rows if self._is_voiceworthy_row(row)]
+        visible_rows = self._merge_unique_rows(active_voice_rows, recent_voice_rows)[:effective_limit]
+
+        if active_voice_rows:
+            speech = self._active_speech(visible_rows, len(active_voice_rows))
             stale = False
-        elif recent_rows:
-            visible_rows = recent_rows[:effective_limit]
+        elif recent_voice_rows:
             speech = self._recent_speech(visible_rows)
             stale = True
         else:
@@ -275,28 +273,23 @@ class StatusStore:
         }
 
     def _active_speech(self, rows: List[sqlite3.Row], total_active: int) -> str:
-        count = len(rows)
         noun = "session" if total_active == 1 else "sessions"
         parts = [f"You have {total_active} active {noun}."]
         for row in rows:
             parts.append(self._spoken_session_line(row))
-        remaining = total_active - count
-        if remaining > 0:
-            more = "session" if remaining == 1 else "sessions"
-            parts.append(f"And {remaining} more active {more}.")
         return " ".join(parts)
 
     def _recent_speech(self, rows: List[sqlite3.Row]) -> str:
-        latest = rows[0]
-        line = self._spoken_session_line(latest)
-        return (
-            "No active sessions right now. "
-            f"Latest recent update: {line}"
-        )
+        if not rows:
+            return "No recent Claude or Codex session updates are available right now."
+        parts = ["Latest recent sessions."]
+        for row in rows:
+            parts.append(self._spoken_session_line(row))
+        return " ".join(parts)
 
     def _spoken_session_line(self, row: sqlite3.Row) -> str:
-        title = row["title"].strip().rstrip(".")
-        summary = row["summary_line"].strip()
+        title = self._clean_title(row["title"], row["cwd"], row["summary_line"]).strip().rstrip(".")
+        summary = self._clean_summary(row["summary_line"], row["status"]).strip()
         if summary and summary[-1] not in ".!?":
             summary = summary + "."
         if not summary:
@@ -322,3 +315,70 @@ class StatusStore:
         now_dt = dt.datetime.fromisoformat((now_iso or utc_now_iso()).replace("Z", "+00:00"))
         cutoff = now_dt - dt.timedelta(seconds=seconds)
         return cutoff.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    def _merge_unique_rows(
+        self, primary: List[sqlite3.Row], secondary: List[sqlite3.Row]
+    ) -> List[sqlite3.Row]:
+        merged: List[sqlite3.Row] = []
+        seen: set[str] = set()
+        for row in [*primary, *secondary]:
+            key = row["session_key"]
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(row)
+        return merged
+
+    def _is_voiceworthy_row(self, row: sqlite3.Row) -> bool:
+        title = (row["title"] or "").strip()
+        summary = (row["summary_line"] or "").strip()
+        if self._looks_like_internal_prompt(title):
+            return False
+        if summary.startswith("{") and self._extract_json_title(summary):
+            return False
+        return True
+
+    def _clean_title(self, title: str | None, cwd: str | None, summary: str | None) -> str:
+        cleaned = (title or "").strip()
+        if not cleaned:
+            cleaned = "Session"
+        if self._looks_like_internal_prompt(cleaned):
+            embedded = self._extract_json_title(summary or "")
+            if embedded:
+                return embedded
+            if cwd:
+                return f"Codex · {Path(cwd).name or cwd}"
+            return "Codex session"
+        return cleaned
+
+    def _clean_summary(self, summary: str | None, status: str) -> str:
+        cleaned = (summary or "").strip()
+        embedded = self._extract_json_title(cleaned)
+        if embedded:
+            return embedded
+        if not cleaned:
+            return self._fallback_summary(status)
+        return cleaned
+
+    def _extract_json_title(self, text: str) -> str:
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return ""
+        if isinstance(parsed, dict):
+            title = str(parsed.get("title") or "").strip()
+            if title:
+                return title[:160]
+        return ""
+
+    def _looks_like_internal_prompt(self, text: str) -> bool:
+        lowered = re.sub(r"\s+", " ", (text or "").strip()).lower()
+        markers = (
+            "you are a helpful assistant.",
+            "you will be presented with a user prompt",
+            "your job is to provide a short title",
+            "read-only final verification",
+            "focus only on these files:",
+            "return either:",
+        )
+        return any(marker in lowered for marker in markers)
