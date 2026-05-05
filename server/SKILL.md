@@ -89,15 +89,15 @@ This is the primary surface for an LLM-driven pipeline.
 ## Block catalog
 
 Every block has a `type` field. Unknown types fall back to body text.
-Unless noted, blocks are content-width (504 px) and centered in the
+Unless noted, blocks are content-width (552 px) and centered in the
 576-px print area.
 
 ### `header`
 ```json
-{"type": "header", "title": "CLAUDE", "subtitle": "TASK COMPLETED", "logo": true}
+{"type": "header", "title": "CLAUDE", "subtitle": "TASK COMPLETED", "logo": false}
 ```
-Logo mark (rosette) above letter-spaced title, dithered fade rule, then
-letter-spaced subtitle. `logo` defaults to `true`. Use exactly one
+Compact text header with no logo by default. Set `logo` to `true` only
+when the caller explicitly wants the rosette mark. Use exactly one
 `header` block, at the top.
 
 ### `title`

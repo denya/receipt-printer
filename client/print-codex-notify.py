@@ -39,6 +39,35 @@ STATUS_TOKEN_FILE = Path(
 ).expanduser()
 MAX_RECENT_TURNS = 400
 RECENT_PURGE_TO = 250
+MAX_TITLE_CHARS = 72
+MAX_RESULT_CHARS = 190
+MAX_SUMMARY_CHARS = 220
+MAX_RESULTS = 5
+MAX_TABLE_ROWS = 12
+SECTION_HEADINGS = {
+    "changed",
+    "changes",
+    "completed",
+    "done",
+    "summary",
+    "verified",
+    "verification",
+    "tests",
+    "status",
+    "next steps",
+    "remaining risks",
+    "risks",
+}
+FOLLOWUP_SUMMARY_MARKERS = (
+    "test",
+    "verified",
+    "deployed",
+    "waiting",
+    "input",
+    "blocked",
+    "fixed",
+    "completed",
+)
 
 
 def safe_string(value: Any) -> str:
@@ -80,9 +109,35 @@ def assistant_message(payload: dict[str, Any]) -> str:
     ).strip()
 
 
+def complete_clip(text: str, limit: int) -> str:
+    text = clean_text(text)
+    if len(text) <= limit:
+        return text
+    window = text[: limit + 1]
+    floor = max(24, int(limit * 0.55))
+    for pattern in (r"[.!?](?=\s|$)", r"[:;](?=\s|$)", r",(?=\s)"):
+        matches = list(re.finditer(pattern, window))
+        matches = [m for m in matches if m.end() >= floor]
+        if matches:
+            return window[: matches[-1].end()].strip()
+    clipped = window[:limit].rsplit(" ", 1)[0].strip(" ,;:-")
+    return clipped + "." if clipped and clipped[-1] not in ".!?" else clipped
+
+
 def clean_text(text: str) -> str:
+    text = safe_string(text)
+    text = re.sub(r"```[\s\S]*?```", " ", text)
+    text = re.sub(r"`([^`\n]+)`", r"\1", text)
+    text = re.sub(r"\[([^\]\n]{1,120})\]\((?:[^)\s]+)(?:\s+\"[^\"]*\")?\)", r"\1", text)
+    text = re.sub(r"https?://\S+|www\.\S+", " ", text)
+    text = re.sub(r"(?<!\w)/(?:[\w .@+-]+/){2,}([\w .@+-]+\.[A-Za-z0-9]+)(?::\d+)?", r"\1", text)
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)
+    text = re.sub(r"(?m)^\s{0,3}>\s?", "", text)
+    text = re.sub(r"(?m)^\s*(?:[-*•]|\d+[.)])\s+", "", text)
+    text = re.sub(r"[*_~]{1,3}", "", text)
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\b(?:at|from|via)\s+(?=(?:without|with|and|for)\b)", "", text)
     return text
 
 
@@ -108,15 +163,35 @@ def json_title(text: str) -> str:
     if isinstance(parsed, dict):
         title = safe_string(parsed.get("title")).strip()
         if title:
-            return clean_text(title)[:120]
+            return complete_clip(title, MAX_TITLE_CHARS)
     return ""
+
+
+def compact_title(text: str, cwd: str = "") -> str:
+    cleaned = clean_text(text)
+    lowered = cleaned.lower()
+    keyword_titles = (
+        (("receipt", "voice"), "Receipt and voice status quality"),
+        (("alexa", "status"), "Alexa status reporting"),
+        (("hook", "status"), "Status hook reliability"),
+        (("printer", "ticket"), "Receipt ticket quality"),
+    )
+    for needles, label in keyword_titles:
+        if all(needle in lowered for needle in needles):
+            return label
+    if not cleaned and cwd:
+        return f"Codex {Path(cwd).name or cwd}"
+    first_sentence = split_sentences(cleaned)[0] if split_sentences(cleaned) else cleaned
+    first_sentence = re.sub(r"^(please|can you|could you|i need you to)\s+", "", first_sentence, flags=re.I)
+    title = complete_clip(first_sentence, MAX_TITLE_CHARS).strip(" .")
+    return title or "Codex session"
 
 
 def derive_title(payload: dict[str, Any]) -> str:
     for item in normalize_input_messages(payload):
         cleaned = clean_text(item)
         if cleaned and not cleaned.startswith("/") and not looks_like_internal_prompt(cleaned):
-            return cleaned[:120]
+            return compact_title(cleaned, safe_string(payload.get("cwd")))
     assistant_title = json_title(assistant_message(payload))
     if assistant_title:
         return assistant_title
@@ -136,6 +211,10 @@ def resolved_status_url() -> str:
     return STATUS_URL or (base_service_url() + "/status/update")
 
 
+def rich_print_url() -> str:
+    return base_service_url() + "/print/rich"
+
+
 def load_status_token() -> str:
     token = safe_string(os.environ.get("STATUS_API_TOKEN")).strip()
     if token:
@@ -146,28 +225,137 @@ def load_status_token() -> str:
         return ""
 
 
+def _split_table_cells(line: str) -> list[str]:
+    line = line.strip()
+    if not line.startswith("|") or not line.endswith("|"):
+        return []
+    cells = [clean_text(cell.strip()) for cell in line.strip("|").split("|")]
+    return cells if any(cells) else []
+
+
+def _is_table_separator(line: str) -> bool:
+    cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell or "") for cell in cells)
+
+
+def extract_markdown_tables(text: str) -> list[dict[str, Any]]:
+    tables: list[dict[str, Any]] = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines) - 1:
+        headers = _split_table_cells(lines[i])
+        if not headers or not _is_table_separator(lines[i + 1]):
+            i += 1
+            continue
+        rows: list[list[str]] = []
+        j = i + 2
+        while j < len(lines):
+            row = _split_table_cells(lines[j])
+            if not row:
+                break
+            if len(row) < len(headers):
+                row.extend([""] * (len(headers) - len(row)))
+            rows.append(row[: len(headers)])
+            j += 1
+        if rows:
+            tables.append({"headers": headers, "rows": rows[:MAX_TABLE_ROWS]})
+        i = max(j, i + 2)
+    return tables
+
+
+def remove_markdown_tables(text: str) -> str:
+    lines = text.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        if i < len(lines) - 1 and _split_table_cells(lines[i]) and _is_table_separator(lines[i + 1]):
+            i += 2
+            while i < len(lines) and _split_table_cells(lines[i]):
+                i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
+def summarize_table_for_voice(table: dict[str, Any]) -> str:
+    headers = [clean_text(h) for h in table.get("headers", []) if clean_text(h)]
+    rows = [[clean_text(cell) for cell in row] for row in table.get("rows", [])]
+    row_count = len(rows)
+    parts: list[str] = []
+    if headers:
+        parts.append(f"Table with {row_count} rows.")
+        parts.append(f"Columns are {' and '.join(headers[:3])}.")
+    else:
+        parts.append(f"Table with {row_count} rows.")
+    for row in rows[:2]:
+        pairs: list[str] = []
+        for header, cell in zip(headers, row):
+            if cell:
+                pairs.append(f"{header} {cell}")
+        if pairs:
+            parts.append(". ".join(pairs[:3]) + ".")
+    return complete_clip(" ".join(parts), MAX_SUMMARY_CHARS)
+
+
+def summarize_tables_for_voice(tables: list[dict[str, Any]]) -> str:
+    if not tables:
+        return ""
+    if len(tables) == 1:
+        return summarize_table_for_voice(tables[0])
+    total_rows = sum(len(table.get("rows", [])) for table in tables)
+    first = summarize_table_for_voice(tables[0])
+    return complete_clip(f"{len(tables)} tables with {total_rows} total rows. {first}", MAX_SUMMARY_CHARS)
+
+
 def extract_results(text: str) -> list[str]:
     bullets: list[str] = []
+    text = remove_markdown_tables(text)
+    in_fence = False
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        line = re.sub(r"^[-*]\s+", "", line)
-        line = re.sub(r"^\d+\.\s+", "", line)
+        if line.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if re.fullmatch(r"[*_`~#>\-\s]+", line):
+            continue
+        if line.rstrip(":").lower() in SECTION_HEADINGS:
+            continue
+        is_item = bool(re.match(r"^\s*(?:[-*•]|\d+[.)])\s+", raw_line))
+        line = re.sub(r"^[-*•]\s+", "", line)
+        line = re.sub(r"^\d+[.)]\s+", "", line)
         line = clean_text(line)
         if not line:
             continue
-        bullets.append(line[:120])
-        if len(bullets) >= 3:
+        if line.rstrip(":").lower() in SECTION_HEADINGS:
+            continue
+        if line.lower().startswith(("if you want", "if you'd like", "next step: if")):
+            continue
+        sentence_parts = split_sentences(line)
+        if not is_item and len(sentence_parts) > 1:
+            continue
+        clipped = complete_clip(line, MAX_RESULT_CHARS)
+        if clipped and clipped not in bullets:
+            bullets.append(clipped)
+        if len(bullets) >= MAX_RESULTS:
             return bullets
 
-    paragraphs = [clean_text(p) for p in text.split("\n\n")]
-    for paragraph in paragraphs:
-        if paragraph:
-            bullets.append(paragraph[:120])
-        if len(bullets) >= 3:
+    if bullets:
+        return bullets[:MAX_RESULTS]
+
+    for sentence in split_sentences(text):
+        if sentence.lower().startswith(("if you want", "if you'd like")):
+            continue
+        clipped = complete_clip(sentence, MAX_RESULT_CHARS)
+        if clipped and clipped not in bullets:
+            bullets.append(clipped)
+        if len(bullets) >= MAX_RESULTS:
             break
-    return bullets[:3]
+    return bullets[:MAX_RESULTS]
 
 
 def split_sentences(text: str) -> list[str]:
@@ -215,12 +403,14 @@ def classify_status(text: str) -> str:
         "verified",
         "shipped",
     )
+    has_blocked = any(marker in lowered for marker in blocked_markers)
+    has_completion = any(marker in lowered for marker in completion_markers)
     if lowered.endswith("?") or any(marker in lowered for marker in waiting_markers):
         return "waiting"
-    if any(marker in lowered for marker in blocked_markers):
-        return "blocked"
-    if any(marker in lowered for marker in completion_markers):
+    if has_completion:
         return "completed"
+    if has_blocked:
+        return "blocked"
     if looks_like_interim_update(text):
         return "running"
     return "unknown"
@@ -230,22 +420,33 @@ def derive_summary_line(text: str, status: str) -> str:
     embedded_title = json_title(text)
     if embedded_title:
         return embedded_title
+    table_summary = summarize_tables_for_voice(extract_markdown_tables(text))
+    if table_summary:
+        return table_summary
     sentences = split_sentences(text)
     if status == "waiting":
         return "Waiting for your input."
     if status == "blocked":
         if sentences:
-            return sentences[0][:160]
+            return complete_clip(sentences[0], MAX_SUMMARY_CHARS)
         return "Blocked right now."
     results = extract_results(text)
     if results:
-        return results[0][:160]
+        combined = " ".join(results[:2])
+        if (
+            status == "completed"
+            and len(combined) <= MAX_SUMMARY_CHARS
+            and len(results) > 1
+            and any(marker in results[1].lower() for marker in FOLLOWUP_SUMMARY_MARKERS)
+        ):
+            return combined
+        return complete_clip(results[0], MAX_SUMMARY_CHARS)
     if sentences:
-        return sentences[0][:160]
+        return complete_clip(sentences[0], MAX_SUMMARY_CHARS)
     fallback = clean_text(text)
     if not fallback:
         return "Status update available."
-    return fallback[:160]
+    return complete_clip(fallback, MAX_SUMMARY_CHARS)
 
 
 def load_state() -> dict[str, Any]:
@@ -281,6 +482,29 @@ def seen_print_turn(payload: dict[str, Any]) -> bool:
     if len(recent) > MAX_RECENT_TURNS:
         recent = recent[-RECENT_PURGE_TO:]
     state["recent_turn_keys"] = recent
+    save_state(state)
+    return False
+
+
+def seen_print_fingerprint(payload: dict[str, Any], text: str) -> bool:
+    title = derive_title(payload)
+    results = extract_results(text)
+    status = classify_status(text)
+    fingerprint = "|".join([title.lower(), status, *[r.lower() for r in results[:3]]])
+    fingerprint = re.sub(r"\W+", " ", fingerprint).strip()
+    if not fingerprint:
+        return False
+    key = "fp:" + fingerprint[:260]
+    state = load_state()
+    recent = state.get("recent_print_fingerprints")
+    if not isinstance(recent, list):
+        recent = []
+    if key in recent:
+        return True
+    recent.append(key)
+    if len(recent) > MAX_RECENT_TURNS:
+        recent = recent[-RECENT_PURGE_TO:]
+    state["recent_print_fingerprints"] = recent
     save_state(state)
     return False
 
@@ -330,9 +554,11 @@ def looks_like_interim_update(text: str) -> bool:
 def local_should_print(payload: dict[str, Any], text: str) -> bool:
     if safe_string(payload.get("type")) not in {"agent-turn-complete", "", "turn-ended"}:
         return False
-    if len(text) < 140:
+    if len(clean_text(text)) < 80:
         return False
     if looks_like_interim_update(text):
+        return False
+    if classify_status(text) in {"running", "waiting", "unknown"}:
         return False
     if not extract_results(text):
         return False
@@ -436,6 +662,26 @@ def post_status_update(payload: dict[str, Any], text: str) -> None:
 
 
 def post_receipt(payload: dict[str, Any], text: str) -> None:
+    tables = extract_markdown_tables(text)
+    if tables:
+        blocks: list[dict[str, Any]] = [
+            {
+                "type": "header",
+                "title": "CODEX",
+                "subtitle": "STATUS",
+                "logo": False,
+            },
+            {"type": "title", "content": derive_title(payload)},
+            {"type": "text", "content": summarize_tables_for_voice(tables), "style": "body"},
+        ]
+        for table in tables:
+            blocks.append({"type": "table", "headers": table["headers"], "rows": table["rows"]})
+        results = extract_results(text)
+        if results:
+            blocks.append({"type": "bullets", "items": results[:3]})
+        post_json(rich_print_url(), {"blocks": blocks})
+        return
+
     body = {
         "brand": "CODEX",
         "title": derive_title(payload),
@@ -475,6 +721,8 @@ def main() -> int:
             debug_log(f"status_update_failed thread={safe_string(payload.get('thread-id') or payload.get('thread_id'))} error={exc!r}")
         if should_print(payload, text):
             if seen_print_turn(payload):
+                return 0
+            if seen_print_fingerprint(payload, text):
                 return 0
             try:
                 post_receipt(payload, text)

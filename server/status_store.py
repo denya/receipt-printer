@@ -349,16 +349,16 @@ class StatusStore:
             if cwd:
                 return f"Codex · {Path(cwd).name or cwd}"
             return "Codex session"
-        return cleaned
+        return self._compact_title(cleaned, cwd)
 
     def _clean_summary(self, summary: str | None, status: str) -> str:
-        cleaned = (summary or "").strip()
+        cleaned = self._sanitize_text(summary or "")
         embedded = self._extract_json_title(cleaned)
         if embedded:
             return embedded
         if not cleaned:
             return self._fallback_summary(status)
-        return cleaned
+        return self._complete_clip(cleaned, 220)
 
     def _extract_json_title(self, text: str) -> str:
         try:
@@ -368,7 +368,7 @@ class StatusStore:
         if isinstance(parsed, dict):
             title = str(parsed.get("title") or "").strip()
             if title:
-                return title[:160]
+                return self._complete_clip(self._sanitize_text(title), 72)
         return ""
 
     def _looks_like_internal_prompt(self, text: str) -> bool:
@@ -382,3 +382,58 @@ class StatusStore:
             "return either:",
         )
         return any(marker in lowered for marker in markers)
+
+    def _compact_title(self, text: str, cwd: str | None = None) -> str:
+        cleaned = self._sanitize_text(text)
+        lowered = cleaned.lower()
+        keyword_titles = (
+            (("receipt", "voice"), "Receipt and voice status quality"),
+            (("alexa", "status"), "Alexa status reporting"),
+            (("hook", "status"), "Status hook reliability"),
+            (("printer", "ticket"), "Receipt ticket quality"),
+        )
+        for needles, label in keyword_titles:
+            if all(needle in lowered for needle in needles):
+                return label
+        if not cleaned and cwd:
+            return f"Codex · {Path(cwd).name or cwd}"
+        first = re.split(r"(?<=[.!?])\s+", cleaned)[0] if cleaned else ""
+        first = re.sub(
+            r"^(please|can you|could you|i need you to)\s+",
+            "",
+            first,
+            flags=re.I,
+        )
+        return self._complete_clip(first, 72).strip(" .") or "Session"
+
+    def _sanitize_text(self, text: str) -> str:
+        text = str(text or "")
+        text = re.sub(r"```[\s\S]*?```", " ", text)
+        text = re.sub(r"`([^`\n]+)`", r"\1", text)
+        text = re.sub(r"\[([^\]\n]{1,120})\]\((?:[^)\s]+)(?:\s+\"[^\"]*\")?\)", r"\1", text)
+        text = re.sub(r"https?://\S+|www\.\S+", " ", text)
+        text = re.sub(
+            r"(?<!\w)/(?:[\w .@+-]+/){2,}([\w .@+-]+\.[A-Za-z0-9]+)(?::\d+)?",
+            r"\1",
+            text,
+        )
+        text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)
+        text = re.sub(r"(?m)^\s{0,3}>\s?", "", text)
+        text = re.sub(r"(?m)^\s*(?:[-*•]|\d+[.)])\s+", "", text)
+        text = re.sub(r"[*_~]{1,3}", "", text)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return re.sub(r"\b(?:at|from|via)\s+(?=(?:without|with|and|for)\b)", "", text)
+
+    def _complete_clip(self, text: str, limit: int) -> str:
+        cleaned = self._sanitize_text(text)
+        if len(cleaned) <= limit:
+            return cleaned
+        window = cleaned[: limit + 1]
+        floor = max(24, int(limit * 0.55))
+        for pattern in (r"[.!?](?=\s|$)", r"[:;](?=\s|$)", r",(?=\s)"):
+            matches = [m for m in re.finditer(pattern, window) if m.end() >= floor]
+            if matches:
+                return window[: matches[-1].end()].strip()
+        clipped = window[:limit].rsplit(" ", 1)[0].strip(" ,;:-")
+        return clipped + "." if clipped and clipped[-1] not in ".!?" else clipped

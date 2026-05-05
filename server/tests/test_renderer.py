@@ -91,6 +91,22 @@ class RendererTests(unittest.TestCase):
 
         self.assertGreater(long.height, short.height)
 
+    def test_render_table_keeps_many_rows_visible_compactly(self) -> None:
+        img = renderer.render_table(
+            headers=["Area", "Changed", "Evidence"],
+            rows=[
+                ["Ticket", "No logo", "header"],
+                ["Margins", "Narrow", "12 px"],
+                ["Alexa", "Plain summary", "voice"],
+                ["Codex", "Skip churn", "filter"],
+                ["Tables", "Structured rows", "rich"],
+                ["Tests", "Covered", "unit"],
+            ],
+        )
+
+        self.assertLess(img.height, 260)
+        self.assertEqual(img.width, renderer.CONTENT_W)
+
     def test_inline_parser_handles_common_markdown(self) -> None:
         runs = renderer._parse_inline(
             "mix **bold** and *italic* and `code` and ~~strike~~ and ***both***"
@@ -139,6 +155,43 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(img.mode, "1")
         self.assertEqual(img.width, renderer.CONTENT_W)
         self.assertGreater(img.height, 144)
+
+    def test_session_ticket_has_compact_edges_and_no_logo_overhead(self) -> None:
+        img = renderer.render_session(
+            brand="CODEX",
+            title="Receipt and voice status quality",
+            results=[
+                "Summaries are readable without markdown links.",
+                "Alexa receives the same compact status facts.",
+                "Waiting state is explicit when input is needed.",
+            ],
+            model="gpt-5.4",
+            turns=8,
+            duration="6m 12s",
+            timestamp="2026-05-06 12:10",
+        )
+
+        ink_bbox = img.convert("L").point(lambda p: 255 - p).getbbox()
+        self.assertIsNotNone(ink_bbox)
+        _, top, _, bottom = ink_bbox
+
+        self.assertLessEqual(top, 18)
+        self.assertLessEqual(img.height - bottom, 10)
+        self.assertLess(img.height, 430)
+
+    def test_renderer_uses_narrow_receipt_margins(self) -> None:
+        self.assertEqual(renderer.PAD_X, 12)
+        self.assertEqual(renderer.CONTENT_W, renderer.CANVAS_WIDTH - 24)
+
+    def test_header_default_has_no_logo_overhead(self) -> None:
+        plain = renderer.render_blocks([
+            {"type": "header", "title": "CODEX", "subtitle": "STATUS"},
+        ])
+        with_logo = renderer.render_blocks([
+            {"type": "header", "title": "CODEX", "subtitle": "STATUS", "logo": True},
+        ])
+
+        self.assertLess(plain.height, with_logo.height)
 
 
 if __name__ == "__main__":

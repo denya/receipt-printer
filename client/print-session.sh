@@ -108,6 +108,30 @@ first_ts = last_ts = None
 first_user_text = None
 last_assistant_texts = []
 
+def clean_report_text(text: str) -> str:
+    text = re.sub(r"```[\s\S]*?```", " ", text or "")
+    text = re.sub(r"`([^`\n]+)`", r"\1", text)
+    text = re.sub(r"\[([^\]\n]{1,120})\]\((?:[^)\s]+)(?:\s+\"[^\"]*\")?\)", r"\1", text)
+    text = re.sub(r"https?://\S+|www\.\S+", " ", text)
+    text = re.sub(r"(?<!\w)/(?:[\w .@+-]+/){2,}([\w .@+-]+\.[A-Za-z0-9]+)(?::\d+)?", r"\1", text)
+    text = re.sub(r"(?m)^\s*(?:[-*•]|\d+[.)])\s+", "", text)
+    text = re.sub(r"[*_~#>`]+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"\b(?:at|from|via)\s+(?=(?:without|with|and|for)\b)", "", text)
+
+def complete_clip(text: str, limit: int) -> str:
+    text = clean_report_text(text)
+    if len(text) <= limit:
+        return text
+    window = text[:limit + 1]
+    floor = max(24, int(limit * 0.55))
+    for pattern in (r"[.!?](?=\s|$)", r"[:;](?=\s|$)", r",(?=\s)"):
+        matches = [m for m in re.finditer(pattern, window) if m.end() >= floor]
+        if matches:
+            return window[:matches[-1].end()].strip()
+    clipped = window[:limit].rsplit(" ", 1)[0].strip(" ,;:-")
+    return clipped + "." if clipped and clipped[-1] not in ".!?" else clipped
+
 if cwd:
     title = f"Claude · {os.path.basename(cwd.rstrip('/')) or cwd}"
 
@@ -135,7 +159,7 @@ if transcript and os.path.exists(transcript):
             text = re.sub(r"<[^>]+>", " ", text)
             text = re.sub(r"\s+", " ", text).strip()
             if text and not text.startswith("Caveat:") and not text.startswith("/"):
-                first_user_text = text
+                first_user_text = complete_clip(text, 72)
         if role == "assistant":
             turns += 1
             m = msg.get("model")
@@ -151,8 +175,8 @@ if transcript and os.path.exists(transcript):
                 last_assistant_texts.append(txt)
 
     if first_user_text:
-        title = first_user_text[:120]
-    results = [t[:120] for t in last_assistant_texts[-3:]]
+        title = first_user_text
+    results = [complete_clip(t, 190) for t in last_assistant_texts[-5:] if complete_clip(t, 190)]
 
 # Need at least one assistant turn to have something to evaluate.
 if not last_assistant_texts:
@@ -174,6 +198,7 @@ if first_ts and last_ts:
 
 
 def clean_text(text: str) -> str:
+    text = clean_report_text(text)
     text = re.sub(r"<[^>]+>", " ", text)
     return re.sub(r"\s+", " ", (text or "")).strip()
 
@@ -223,12 +248,14 @@ def classify_status(text: str) -> str:
         "verified",
         "shipped",
     )
+    has_blocked = any(marker in lowered for marker in blocked_markers)
+    has_completion = any(marker in lowered for marker in completion_markers)
     if lowered.endswith("?") or any(marker in lowered for marker in waiting_markers):
         return "waiting"
-    if any(marker in lowered for marker in blocked_markers):
-        return "blocked"
-    if any(marker in lowered for marker in completion_markers):
+    if has_completion:
         return "completed"
+    if has_blocked:
+        return "blocked"
     interim_starts = (
         "i'm ", "i am ", "i’ll ", "i will ", "checking ", "inspecting ",
         "reviewing ", "running ", "looking ", "mapping ", "tracing ",
@@ -242,9 +269,13 @@ def derive_summary_line(text: str, status: str) -> str:
     if status == "waiting":
         return "Waiting for your input."
     sentences = split_sentences(text)
+    if status == "completed" and len(sentences) >= 2 and re.search(r"test|verified|deployed|waiting|input|blocked|fixed|completed", sentences[1], re.I):
+        combined = complete_clip(sentences[0], 110) + " " + complete_clip(sentences[1], 110)
+        if len(combined) <= 220:
+            return combined
     if sentences:
-        return sentences[0][:160]
-    return clean_text(text)[:160] or "Status update available."
+        return complete_clip(sentences[0], 220)
+    return complete_clip(clean_text(text), 220) or "Status update available."
 
 
 def load_status_token() -> str:

@@ -127,7 +127,7 @@ class PrinterService:
             p.image(img, impl="bitImageRaster",
                     high_density_horizontal=True,
                     high_density_vertical=True)
-            p.text("\n\n\n")
+            p.text("\n")
             p.cut()
         await self._run(job)
 

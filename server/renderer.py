@@ -34,7 +34,7 @@ import qrcode
 # ---------- canvas geometry ----------
 
 CANVAS_WIDTH = 576
-PAD_X = 36
+PAD_X = 12
 CONTENT_W = CANVAS_WIDTH - 2 * PAD_X
 
 FONT_REGULAR = (
@@ -87,14 +87,15 @@ FONT_MONO = (
     "Courier New.ttf",
 )
 
-# +1 pt across the board vs prior version.
-FS_BRAND    = 45
+# Session receipts are intentionally compact: no logo, no ornamental footer,
+# and only enough margin to keep cutter noise away from text.
+FS_BRAND    = 30
 FS_SUBTITLE = 17
-FS_TITLE    = 27
+FS_TITLE    = 25
 FS_BODY     = 23
 FS_META     = 21
 FS_TIME     = 19
-FS_CAPTION  = 18
+FS_CAPTION  = 17
 
 
 # ---------- helpers ----------
@@ -788,13 +789,13 @@ def render_table(headers: List[str],
     if n_cols == 0:
         return Image.new("1", (width, 1), 1)
     col_w = width // n_cols
-    pad = 8
-    min_row_h = FS_CAPTION + 14
+    pad = 5
+    min_row_h = FS_CAPTION + 10
     body_line_h = int(_measure(ImageDraw.Draw(Image.new("L", (1, 1), 255)),
-                               "Mg", f_r)[1] * 1.25)
+                               "Mg", f_r)[1] * 1.12)
     header_h = max(min_row_h, int(_measure(
-        ImageDraw.Draw(Image.new("L", (1, 1), 255)), "Mg", f_h)[1] * 1.25) + 10)
-    title_h = (FS_BODY + 10) if title else 0
+        ImageDraw.Draw(Image.new("L", (1, 1), 255)), "Mg", f_h)[1] * 1.12) + 8)
+    title_h = (FS_BODY + 6) if title else 0
 
     wrapped_rows: List[Tuple[List[List[str]], int]] = []
     for row in rows:
@@ -806,7 +807,7 @@ def render_table(headers: List[str],
                           cell, f_r, col_w - 2 * pad) or [""]
             wrapped_cells.append(lines)
             max_lines = max(max_lines, len(lines))
-        row_h = max(min_row_h, max_lines * body_line_h + 10)
+        row_h = max(min_row_h, max_lines * body_line_h + 8)
         wrapped_rows.append((wrapped_cells, row_h))
 
     height = title_h + header_h + 4 + sum(row_h for _, row_h in wrapped_rows)
@@ -884,25 +885,22 @@ def render_qr_code(data: str,
 def _block_header(b: Dict[str, Any]) -> Image.Image:
     title = str(b.get("title", "CLAUDE"))
     subtitle = b.get("subtitle")
-    show_logo = bool(b.get("logo", True))
+    show_logo = bool(b.get("logo", False))
 
     f_brand = _font(FONT_BOLD, FS_BRAND)
     f_sub = _font(FONT_REGULAR, FS_SUBTITLE)
-    spaced = "  ".join(title)
-    sub_spaced = " ".join(str(subtitle).upper()) if subtitle else None
+    spaced = " ".join(title)
+    sub_spaced = str(subtitle).upper() if subtitle else None
 
     tmp = ImageDraw.Draw(Image.new("L", (1, 1), 255))
     bw, bh = _measure(tmp, spaced, f_brand)
     sw, sh = _measure(tmp, sub_spaced, f_sub) if sub_spaced else (0, 0)
 
     logo_size = 56 if show_logo else 0
-    fade_h = 12
-
     y_logo = 0
     y_brand = (logo_size + 14) if show_logo else 0
-    y_fade = y_brand + bh + 18
-    y_sub = y_fade + fade_h + 10 if sub_spaced else 0
-    height = (y_sub + sh + 6) if sub_spaced else (y_fade + fade_h + 6)
+    y_sub = y_brand + bh + 3 if sub_spaced else 0
+    height = (y_sub + sh + 1) if sub_spaced else (y_brand + bh + 1)
 
     text_l = Image.new("L", (CONTENT_W, height), 255)
     draw = ImageDraw.Draw(text_l)
@@ -918,9 +916,7 @@ def _block_header(b: Dict[str, Any]) -> Image.Image:
         draw.text(((CONTENT_W - sw) // 2, y_sub),
                   sub_spaced, font=f_sub, fill=0)
 
-    text_bw = _to_bw_text(text_l)
-    text_bw.paste(_orn_fade(CONTENT_W), (0, y_fade))
-    return text_bw
+    return _to_bw_text(text_l)
 
 
 def _block_title(b: Dict[str, Any]) -> Image.Image:
@@ -1108,8 +1104,8 @@ _BLOCK_RENDERERS = {
 
 # Per-block-type vertical gap below the block. Tuned for visual rhythm.
 _GAP_AFTER = {
-    "header":       18,
-    "title":        14,
+    "header":       10,
+    "title":        10,
     "text":         8,
     "bullets":      14,
     "ornament":     14,
@@ -1144,9 +1140,10 @@ def render_blocks(blocks: List[Dict[str, Any]]) -> Image.Image:
             img = _to_bw_text(err_l)
         rendered.append((b, img))
 
-    # Compute total height with per-block gaps; first/last get top/bottom pad.
-    pad_top = 28
-    pad_bottom = 32
+    # Compute total height with per-block gaps. Keep edge padding minimal so
+    # tickets do not waste paper before the first line or after the last fact.
+    pad_top = 2
+    pad_bottom = 2
     total_h = pad_top + pad_bottom
     for i, (b, img) in enumerate(rendered):
         total_h += img.height
@@ -1182,12 +1179,11 @@ def render_session(brand: str,
     header_title = (brand or "CLAUDE").strip().upper()[:20]
     blocks: List[Dict[str, Any]] = [
         {"type": "header", "title": header_title,
-         "subtitle": "TASK COMPLETED", "logo": True},
+         "subtitle": "STATUS", "logo": False},
         {"type": "title", "content": title},
     ]
     if results:
         blocks.append({"type": "bullets", "items": list(results)})
-    blocks.append({"type": "ornament", "style": "flourish"})
 
     parts: List[str] = []
     if model:
@@ -1201,5 +1197,4 @@ def render_session(brand: str,
                         "content": "   ·   ".join(parts),
                         "style": "meta"})
     blocks.append({"type": "text", "content": ts, "style": "time"})
-    blocks.append({"type": "ornament", "style": "fade"})
     return render_blocks(blocks)

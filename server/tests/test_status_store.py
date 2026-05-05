@@ -127,3 +127,31 @@ class StatusStoreTests(unittest.TestCase):
             self.assertNotIn("No active sessions right now", payload["speech_text"])
             self.assertIn("Second recent session", payload["speech_text"])
             self.assertIn("First recent session", payload["speech_text"])
+
+    def test_voice_payload_strips_links_code_blocks_and_long_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = StatusStore(
+                db_path=str(pathlib.Path(tmpdir) / "status.db"),
+                active_window_seconds=1800,
+                recent_window_seconds=86400,
+            )
+            store.ingest(SessionStatusUpdate(
+                source="codex",
+                session_key="quality-1",
+                turn_key="quality-1:1",
+                title="Please improve receipt printing and Alexa voice status reporting with a very long raw prompt",
+                summary_line=(
+                    "Updated [`server/renderer.py`](/Users/denya/code/random-vibe-coding/"
+                    "receipt-printer/server/renderer.py:12) and removed ```code``` "
+                    "formatting. See https://example.com/down/link"
+                ),
+                status="completed",
+            ))
+
+            speech = store.voice_payload(limit=1)["speech_text"]
+
+            self.assertIn("Receipt and voice status quality", speech)
+            self.assertIn("server/renderer.py", speech)
+            self.assertNotIn("http", speech)
+            self.assertNotIn("```", speech)
+            self.assertNotIn("/Users/denya", speech)
