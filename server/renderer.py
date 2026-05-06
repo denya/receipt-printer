@@ -810,7 +810,8 @@ def render_table(headers: List[str],
         row_h = max(min_row_h, max_lines * body_line_h + 8)
         wrapped_rows.append((wrapped_cells, row_h))
 
-    height = title_h + header_h + 4 + sum(row_h for _, row_h in wrapped_rows)
+    bottom_pad = 8
+    height = title_h + header_h + 4 + sum(row_h for _, row_h in wrapped_rows) + bottom_pad
 
     img = Image.new("L", (width, height), 255)
     draw = ImageDraw.Draw(img)
@@ -831,6 +832,8 @@ def render_table(headers: List[str],
                 cell_y += body_line_h
         y += row_h
         draw.line((0, y - 1, width - 1, y - 1), fill=0, width=1)
+    if wrapped_rows:
+        draw.line((0, y - 2, width - 1, y - 2), fill=0, width=2)
     return _to_bw_text(img)
 
 
@@ -893,14 +896,18 @@ def _block_header(b: Dict[str, Any]) -> Image.Image:
     sub_spaced = str(subtitle).upper() if subtitle else None
 
     tmp = ImageDraw.Draw(Image.new("L", (1, 1), 255))
-    bw, bh = _measure(tmp, spaced, f_brand)
-    sw, sh = _measure(tmp, sub_spaced, f_sub) if sub_spaced else (0, 0)
+    bw, _ = _measure(tmp, spaced, f_brand)
+    sw, _ = _measure(tmp, sub_spaced, f_sub) if sub_spaced else (0, 0)
+    brand_top, brand_bottom = tmp.textbbox((0, 0), spaced, font=f_brand)[1::2]
+    sub_top, sub_bottom = tmp.textbbox((0, 0), sub_spaced, font=f_sub)[1::2] if sub_spaced else (0, 0)
+    brand_line_h = brand_bottom - min(0, brand_top)
+    sub_line_h = sub_bottom - min(0, sub_top) if sub_spaced else 0
 
     logo_size = 56 if show_logo else 0
     y_logo = 0
     y_brand = (logo_size + 14) if show_logo else 0
-    y_sub = y_brand + bh + 3 if sub_spaced else 0
-    height = (y_sub + sh + 1) if sub_spaced else (y_brand + bh + 1)
+    y_sub = y_brand + brand_line_h + 8 if sub_spaced else 0
+    height = (y_sub + sub_line_h + 2) if sub_spaced else (y_brand + brand_line_h + 2)
 
     text_l = Image.new("L", (CONTENT_W, height), 255)
     draw = ImageDraw.Draw(text_l)

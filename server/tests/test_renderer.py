@@ -107,6 +107,27 @@ class RendererTests(unittest.TestCase):
         self.assertLess(img.height, 260)
         self.assertEqual(img.width, renderer.CONTENT_W)
 
+    def test_render_table_draws_protected_bottom_border(self) -> None:
+        img = renderer.render_table(
+            headers=["Area", "Changed", "Evidence"],
+            rows=[
+                ["Ticket", "No logo", "header"],
+                ["Margins", "Narrow", "12 px"],
+                ["Alexa", "Plain summary", "voice"],
+                ["Codex", "Skip churn", "filter"],
+                ["Tables", "Structured rows", "rich"],
+            ],
+        ).convert("L")
+
+        dark_rows = [
+            sum(1 for x in range(img.width) if img.getpixel((x, y)) < 128)
+            for y in range(img.height)
+        ]
+        full_width_rows = [i for i, dark in enumerate(dark_rows) if dark == img.width]
+
+        self.assertGreaterEqual(len(full_width_rows), 2)
+        self.assertGreaterEqual(img.height - max(full_width_rows), 8)
+
     def test_inline_parser_handles_common_markdown(self) -> None:
         runs = renderer._parse_inline(
             "mix **bold** and *italic* and `code` and ~~strike~~ and ***both***"
@@ -192,6 +213,29 @@ class RendererTests(unittest.TestCase):
         ])
 
         self.assertLess(plain.height, with_logo.height)
+
+    def test_large_header_keeps_subtitle_separate(self) -> None:
+        img = renderer.render_blocks([
+            {"type": "header", "title": "CODEX", "subtitle": "DEPLOY TEST"},
+        ]).convert("L")
+
+        dark_rows = [
+            sum(1 for x in range(img.width) if img.getpixel((x, y)) < 128)
+            for y in range(img.height)
+        ]
+        ink_rows = [i for i, dark in enumerate(dark_rows) if dark > 0]
+        groups = []
+        start = prev = ink_rows[0]
+        for row in ink_rows[1:]:
+            if row == prev + 1:
+                prev = row
+                continue
+            groups.append((start, prev))
+            start = prev = row
+        groups.append((start, prev))
+
+        self.assertGreaterEqual(len(groups), 2)
+        self.assertGreaterEqual(groups[1][0] - groups[0][1], 5)
 
 
 if __name__ == "__main__":
